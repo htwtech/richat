@@ -1,25 +1,44 @@
 use {
     crate::{
         config::{deserialize_humansize_usize, deserialize_num_str},
-        transports::{RecvError, RecvStream, Subscribe, SubscribeError},
+        transports::{RecvError, Subscribe},
     },
-    futures::stream::{BoxStream, StreamExt},
+    futures::stream::StreamExt,
     memmap2::MmapMut,
     richat_proto::richat::RichatFilter,
     serde::Deserialize,
-    solana_clock::Slot,
     std::{
-        fs::{self, File, OpenOptions},
+        fs::{self, OpenOptions},
         future::Future,
         io,
         path::PathBuf,
-        sync::atomic::{AtomicI64, AtomicU64, Ordering, fence},
+        sync::atomic::{AtomicI64, AtomicU64, Ordering},
+        time::Duration,
     },
     thiserror::Error,
     tokio::task::JoinError,
     tokio_util::sync::CancellationToken,
     tracing::{error, info},
 };
+
+/// Serde-friendly filter config that maps to `RichatFilter`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigShmFilter {
+    pub disable_accounts: bool,
+    pub disable_transactions: bool,
+    pub disable_entries: bool,
+}
+
+impl From<ConfigShmFilter> for RichatFilter {
+    fn from(f: ConfigShmFilter) -> Self {
+        RichatFilter {
+            disable_accounts: f.disable_accounts,
+            disable_transactions: f.disable_transactions,
+            disable_entries: f.disable_entries,
+        }
+    }
+}
 
 // --- Constants ---
 
@@ -48,16 +67,18 @@ impl ShmHeader {
     ///
     /// `ptr` must point to at least `HEADER_SIZE` bytes of memory that remain valid
     /// for the lifetime `'a`, and must be properly aligned for `ShmHeader`.
-    pub unsafe fn from_ptr<'a>(ptr: *const u8) -> &'a ShmHeader {
-        &*(ptr as *const ShmHeader)
+    #[inline]
+    pub const unsafe fn from_ptr<'a>(ptr: *const u8) -> &'a ShmHeader {
+        unsafe { &*(ptr as *const ShmHeader) }
     }
 
     /// # Safety
     ///
     /// `ptr` must point to at least `HEADER_SIZE` bytes of writable memory that
     /// remain valid for the lifetime `'a`, and must be properly aligned for `ShmHeader`.
+    #[inline]
     pub unsafe fn from_ptr_mut<'a>(ptr: *mut u8) -> &'a mut ShmHeader {
-        &mut *(ptr as *mut ShmHeader)
+        unsafe { &mut *(ptr as *mut ShmHeader) }
     }
 }
 
@@ -84,16 +105,18 @@ impl ShmIndexEntry {
     ///
     /// `ptr` must point to at least `INDEX_ENTRY_SIZE` bytes of valid memory,
     /// properly aligned for `ShmIndexEntry`, and remain valid for the lifetime `'a`.
-    pub unsafe fn from_ptr<'a>(ptr: *const u8) -> &'a ShmIndexEntry {
-        &*(ptr as *const ShmIndexEntry)
+    #[inline]
+    pub const unsafe fn from_ptr<'a>(ptr: *const u8) -> &'a ShmIndexEntry {
+        unsafe { &*(ptr as *const ShmIndexEntry) }
     }
 
     /// # Safety
     ///
     /// `ptr` must point to at least `INDEX_ENTRY_SIZE` bytes of writable memory,
     /// properly aligned for `ShmIndexEntry`, and remain valid for the lifetime `'a`.
+    #[inline]
     pub unsafe fn from_ptr_mut<'a>(ptr: *mut u8) -> &'a mut ShmIndexEntry {
-        &mut *(ptr as *mut ShmIndexEntry)
+        unsafe { &mut *(ptr as *mut ShmIndexEntry) }
     }
 }
 
@@ -103,6 +126,7 @@ const _: () = assert!(size_of::<ShmIndexEntry>() == INDEX_ENTRY_SIZE);
 
 /// Copy `len` bytes from a ring buffer starting at `offset` into `dst`.
 /// Handles wrap-around when `offset + len > ring.len()`.
+#[inline]
 pub fn copy_from_ring(ring: &[u8], offset: usize, len: usize, dst: &mut [u8]) {
     debug_assert!(dst.len() >= len);
     debug_assert!(offset < ring.len());
@@ -118,6 +142,7 @@ pub fn copy_from_ring(ring: &[u8], offset: usize, len: usize, dst: &mut [u8]) {
 
 /// Copy `src` into a ring buffer starting at `offset`.
 /// Handles wrap-around when `offset + src.len() > ring.len()`.
+#[inline]
 pub fn copy_to_ring(ring: &mut [u8], offset: usize, src: &[u8]) {
     debug_assert!(offset < ring.len());
 
@@ -140,8 +165,6 @@ pub enum ShmError {
     SetLen(io::Error),
     #[error("failed to mmap shm file: {0}")]
     Mmap(io::Error),
-    #[error("failed to subscribe: {0}")]
-    Subscribe(#[from] SubscribeError),
 }
 
 // --- Config ---
@@ -162,7 +185,7 @@ pub struct ConfigShmServer {
     )]
     pub max_bytes: usize,
     #[serde(default)]
-    pub filter: Option<RichatFilter>,
+    pub filter: Option<ConfigShmFilter>,
 }
 
 impl ConfigShmServer {
@@ -181,11 +204,19 @@ impl ConfigShmServer {
 
 // --- Writer ---
 
-fn next_power_of_two(n: usize) -> usize {
+const fn next_power_of_two(n: usize) -> usize {
     n.next_power_of_two()
 }
 
 pub struct ShmServer;
+
+/// A Send-safe wrapper around MmapMut.
+/// SAFETY: ShmServer is the sole writer; readers use a separate read-only mmap.
+/// The mmap is moved into the blocking thread and never shared across threads.
+struct SendMmap(MmapMut);
+
+// SAFETY: MmapMut is only accessed from a single thread (the blocking writer thread).
+unsafe impl Send for SendMmap {}
 
 impl ShmServer {
     pub async fn spawn(
@@ -230,11 +261,11 @@ impl ShmServer {
         }
 
         // Initialize index entries: all seq = -1
-        let index_base = unsafe { ptr.add(HEADER_SIZE) };
         for i in 0..idx_capacity {
-            // SAFETY: index_base + i * INDEX_ENTRY_SIZE is within the mmap
+            // SAFETY: index region is within mmap bounds
             unsafe {
-                let entry = ShmIndexEntry::from_ptr_mut(index_base.add(i * INDEX_ENTRY_SIZE));
+                let entry_ptr = ptr.add(HEADER_SIZE + i * INDEX_ENTRY_SIZE);
+                let entry = ShmIndexEntry::from_ptr_mut(entry_ptr);
                 entry.seq = AtomicI64::new(-1);
                 entry.data_off = 0;
                 entry.data_len = 0;
@@ -243,31 +274,152 @@ impl ShmServer {
             }
         }
 
-        // Subscribe to the ring buffer
-        let stream = messages.subscribe(None, config.filter)?;
+        let filter = config.filter.map(RichatFilter::from);
 
         let path = config.path.clone();
         info!(path = %path.display(), idx_capacity, data_capacity, "shm server started");
 
-        let jh = tokio::spawn(async move {
-            Self::run(
-                mmap,
-                stream,
-                idx_capacity,
-                data_capacity,
-                idx_mask,
-                shutdown.clone(),
-            )
-            .await;
+        // Use a channel to bridge async stream -> blocking writer thread
+        let (tx, rx) = kanal::bounded(4096);
 
-            // On shutdown: mark closed and remove the file
-            let ptr = mmap.as_ptr();
-            // SAFETY: header is still valid, we have not unmapped
-            unsafe {
-                let header = ShmHeader::from_ptr(ptr);
-                header.closed.store(1, Ordering::Release);
+        // Async task: subscribes to the ring buffer and forwards messages to channel.
+        // Uses a resubscribe loop to handle stale initial position (the ring buffer
+        // initializes with tail=max_messages but never writes to that position).
+        let shutdown_clone = shutdown.clone();
+        let reader_jh = tokio::spawn(async move {
+            'subscribe: loop {
+                let mut stream = match messages.subscribe(None, filter.clone()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("shm writer: failed to subscribe: {e}");
+                        tokio::select! {
+                            () = tokio::time::sleep(Duration::from_secs(1)) => continue 'subscribe,
+                            () = shutdown_clone.cancelled() => return,
+                        }
+                    }
+                };
+
+                // Wait for first message with timeout. If we subscribed before any
+                // data was pushed, the stream starts at a position that will never
+                // be written. Resubscribing after data is flowing fixes this.
+                let first = tokio::select! {
+                    result = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        stream.next(),
+                    ) => {
+                        match result {
+                            Ok(Some(Ok(data))) => data,
+                            Ok(Some(Err(RecvError::Lagged))) => {
+                                info!("shm writer: source lagged, resubscribing");
+                                continue 'subscribe;
+                            }
+                            Ok(Some(Err(RecvError::Closed))) | Ok(None) => {
+                                info!("shm writer: source stream closed");
+                                return;
+                            }
+                            Err(_) => {
+                                // Timeout - position likely stale, resubscribe
+                                continue 'subscribe;
+                            }
+                        }
+                    }
+                    () = shutdown_clone.cancelled() => return,
+                };
+
+                if tx.as_async().send(first).await.is_err() {
+                    return;
+                }
+
+                // Normal read loop
+                loop {
+                    let item = tokio::select! {
+                        item = stream.next() => item,
+                        () = shutdown_clone.cancelled() => return,
+                    };
+                    match item {
+                        Some(Ok(data)) => {
+                            if tx.as_async().send(data).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(Err(RecvError::Lagged)) => {
+                            info!("shm writer: source lagged, resubscribing");
+                            continue 'subscribe;
+                        }
+                        Some(Err(RecvError::Closed)) | None => {
+                            info!("shm writer: source stream closed");
+                            return;
+                        }
+                    }
+                }
             }
+        });
+
+        // Blocking writer thread: receives from channel, writes to mmap
+        let send_mmap = SendMmap(mmap);
+        let writer_jh = tokio::task::spawn_blocking(move || {
+            let SendMmap(mut mmap) = send_mmap;
+            let ptr = mmap.as_mut_ptr();
+            let index_base_offset = HEADER_SIZE;
+            let data_base_offset = HEADER_SIZE + idx_capacity * INDEX_ENTRY_SIZE;
+
+            let mut pos: u64 = 0;
+            let mut data_pos: u64 = 0;
+
+            while let Ok(data) = rx.recv() {
+                let data_bytes: &[u8] = &data;
+                let data_len = data_bytes.len();
+
+                // 1. Compute index slot
+                let idx = (pos & idx_mask) as usize;
+
+                // 2. Write data bytes into data ring with wrap-around
+                let data_ring_offset = (data_pos % data_capacity as u64) as usize;
+                // SAFETY: data region is within mmap bounds, we are the sole writer
+                let data_ring = unsafe {
+                    std::slice::from_raw_parts_mut(ptr.add(data_base_offset), data_capacity)
+                };
+                copy_to_ring(data_ring, data_ring_offset, data_bytes);
+
+                // 3. Write index entry metadata
+                // SAFETY: index region is within bounds
+                let entry = unsafe {
+                    ShmIndexEntry::from_ptr_mut(
+                        ptr.add(index_base_offset + idx * INDEX_ENTRY_SIZE),
+                    )
+                };
+                entry.data_off = data_pos;
+                entry.data_len = data_len as u32;
+                entry.slot = 0; // slot not tracked in shm
+
+                // 4. Advance data position
+                data_pos += data_len as u64;
+
+                // 5. Update header.data_tail (Relaxed is safe: readers synchronize
+                // via seq.load(Acquire) which pairs with seq.store(Release) below,
+                // guaranteeing visibility of all prior writes including data_tail)
+                let header = unsafe { ShmHeader::from_ptr(ptr) };
+                header.data_tail.store(data_pos, Ordering::Relaxed);
+
+                // 6. COMMIT: set seq to pos
+                entry.seq.store(pos as i64, Ordering::Release);
+
+                // 7. Advance position
+                pos += 1;
+
+                // 8. Update header.tail
+                header.tail.store(pos, Ordering::Release);
+            }
+
+            // Mark closed
+            let header = unsafe { ShmHeader::from_ptr(ptr) };
+            header.closed.store(1, Ordering::Release);
             drop(mmap);
+        });
+
+        let jh = tokio::spawn(async move {
+            let _ = reader_jh.await;
+            let _ = writer_jh.await;
             drop(file);
             if let Err(error) = fs::remove_file(&path) {
                 error!(path = %path.display(), %error, "failed to remove shm file");
@@ -275,79 +427,6 @@ impl ShmServer {
         });
 
         Ok(jh)
-    }
-
-    async fn run(
-        mut mmap: MmapMut,
-        mut stream: RecvStream,
-        idx_capacity: usize,
-        data_capacity: usize,
-        idx_mask: u64,
-        shutdown: CancellationToken,
-    ) {
-        let ptr = mmap.as_mut_ptr();
-        let index_base = unsafe { ptr.add(HEADER_SIZE) };
-        let data_base_offset = HEADER_SIZE + idx_capacity * INDEX_ENTRY_SIZE;
-
-        let mut pos: u64 = 0;
-        let mut data_pos: u64 = 0;
-
-        loop {
-            let item = tokio::select! {
-                item = stream.next() => item,
-                () = shutdown.cancelled() => break,
-            };
-
-            let data = match item {
-                Some(Ok(data)) => data,
-                Some(Err(RecvError::Lagged)) => {
-                    error!("shm writer: source stream lagged");
-                    continue;
-                }
-                Some(Err(RecvError::Closed)) | None => {
-                    info!("shm writer: source stream closed");
-                    break;
-                }
-            };
-
-            let data_bytes: &[u8] = &data;
-            let data_len = data_bytes.len();
-
-            // 1. Compute index slot
-            let idx = (pos & idx_mask) as usize;
-
-            // 2. Write data bytes into data ring with wrap-around
-            let data_ring_offset = (data_pos % data_capacity as u64) as usize;
-            // SAFETY: data_base_offset + data_ring is within mmap bounds
-            let data_ring =
-                unsafe { std::slice::from_raw_parts_mut(ptr.add(data_base_offset), data_capacity) };
-            copy_to_ring(data_ring, data_ring_offset, data_bytes);
-
-            // 3. Write index entry metadata
-            // SAFETY: index_base + idx * INDEX_ENTRY_SIZE is within bounds
-            let entry =
-                unsafe { ShmIndexEntry::from_ptr_mut(index_base.add(idx * INDEX_ENTRY_SIZE)) };
-            entry.data_off = data_pos;
-            entry.data_len = data_len as u32;
-            entry.slot = 0; // slot not tracked in shm
-
-            // 4. Advance data position
-            data_pos += data_len as u64;
-
-            // 5. Update header.data_tail
-            // SAFETY: header is valid
-            let header = unsafe { ShmHeader::from_ptr(ptr) };
-            header.data_tail.store(data_pos, Ordering::Release);
-
-            // 6. COMMIT: set seq to pos
-            entry.seq.store(pos as i64, Ordering::Release);
-
-            // 7. Advance position
-            pos += 1;
-
-            // 8. Update header.tail
-            header.tail.store(pos, Ordering::Release);
-        }
     }
 }
 
@@ -400,15 +479,13 @@ mod tests {
 
     #[test]
     fn test_write_read_single_message() {
-        // Create an in-memory buffer simulating mmap
-        let idx_capacity: usize = 4; // power of 2
+        let idx_capacity: usize = 4;
         let data_capacity: usize = 64;
         let total_size = HEADER_SIZE + idx_capacity * INDEX_ENTRY_SIZE + data_capacity;
         let mut buf = vec![0u8; total_size];
 
         let ptr = buf.as_mut_ptr();
 
-        // Init header
         unsafe {
             let header = ShmHeader::from_ptr_mut(ptr);
             header.magic = MAGIC;
@@ -420,7 +497,6 @@ mod tests {
             header.closed = AtomicU64::new(0);
         }
 
-        // Init index entries
         let index_base = unsafe { ptr.add(HEADER_SIZE) };
         for i in 0..idx_capacity {
             unsafe {
@@ -429,7 +505,6 @@ mod tests {
             }
         }
 
-        // Write a message
         let msg = b"hello world";
         let idx_mask = (idx_capacity - 1) as u64;
         let pos: u64 = 0;
@@ -454,7 +529,6 @@ mod tests {
         entry.seq.store(pos as i64, Ordering::Release);
         header.tail.store(pos + 1, Ordering::Release);
 
-        // Read back
         let read_header = unsafe { ShmHeader::from_ptr(ptr as *const u8) };
         assert_eq!(read_header.tail.load(Ordering::Acquire), 1);
 
@@ -465,8 +539,9 @@ mod tests {
         assert_eq!(read_entry.seq.load(Ordering::Acquire), 0);
         assert_eq!(read_entry.data_len, msg.len() as u32);
 
-        let data_ring_ro =
-            unsafe { std::slice::from_raw_parts(ptr.add(data_base_offset) as *const u8, data_capacity) };
+        let data_ring_ro = unsafe {
+            std::slice::from_raw_parts(ptr.add(data_base_offset) as *const u8, data_capacity)
+        };
         let mut result = vec![0u8; msg.len()];
         copy_from_ring(
             data_ring_ro,
@@ -486,7 +561,6 @@ mod tests {
         let ptr = buf.as_mut_ptr();
         let idx_mask = (idx_capacity - 1) as u64;
 
-        // Init header
         unsafe {
             let header = ShmHeader::from_ptr_mut(ptr);
             header.magic = MAGIC;
@@ -511,7 +585,6 @@ mod tests {
         let mut pos: u64 = 0;
         let mut data_pos: u64 = 0;
 
-        // Write all messages
         for msg in &messages {
             let idx = (pos & idx_mask) as usize;
             let data_ring = unsafe {
@@ -537,7 +610,6 @@ mod tests {
             header.tail.store(pos, Ordering::Release);
         }
 
-        // Read all messages back
         let header = unsafe { ShmHeader::from_ptr(ptr as *const u8) };
         assert_eq!(header.tail.load(Ordering::Acquire), 3);
 
@@ -567,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_lag_detection() {
-        let idx_capacity: usize = 2; // very small ring
+        let idx_capacity: usize = 2;
         let data_capacity: usize = 32;
         let total_size = HEADER_SIZE + idx_capacity * INDEX_ENTRY_SIZE + data_capacity;
         let mut buf = vec![0u8; total_size];
@@ -597,7 +669,6 @@ mod tests {
         let mut pos: u64 = 0;
         let mut data_pos: u64 = 0;
 
-        // Write 3 messages into a ring of size 2 (overwrites first)
         for msg in [b"aa" as &[u8], b"bb", b"cc"] {
             let idx = (pos & idx_mask) as usize;
             let data_ring = unsafe {
@@ -623,8 +694,6 @@ mod tests {
             header.tail.store(pos, Ordering::Release);
         }
 
-        // Reader trying to read position 0: should detect lag
-        // because index slot 0 now has seq=2 (from message "cc"), not 0
         let reader_pos: u64 = 0;
         let idx = (reader_pos & idx_mask) as usize;
         let entry = unsafe {
@@ -632,6 +701,6 @@ mod tests {
         };
         let seq = entry.seq.load(Ordering::Acquire);
         assert_ne!(seq, reader_pos as i64, "should detect lag: seq was overwritten");
-        assert_eq!(seq, 2); // position 2 wrote to slot 0
+        assert_eq!(seq, 2);
     }
 }

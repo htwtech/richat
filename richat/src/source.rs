@@ -15,7 +15,7 @@ use {
     richat_client::{
         grpc::{ConfigGrpcClient, GrpcClientBuilderError},
         quic::{ConfigQuicClient, QuicConnectError},
-        shm::{ConfigShmClient, ShmConnectError, ShmReceiveError, ShmSubscription},
+        shm::{ConfigShmClient, ShmConnectError, ShmSubscription},
     },
     richat_filter::message::{Message, MessageParseError, MessageParserEncoding},
     richat_proto::{
@@ -311,19 +311,17 @@ impl Subscription {
             SubscriptionConfig::Shm { config } => {
                 let sub = ShmSubscription::open(&config).map_err(ConnectError::Shm)?;
                 info!(name, "attached to shared memory");
-                sub.subscribe()
-                    .map(|r| {
-                        r.map(|data| std::sync::Arc::new(data))
-                            .map_err(|e| match e {
-                                ShmReceiveError::Lagged => {
-                                    richat_client::error::ReceiveError::Lagged
-                                }
-                                ShmReceiveError::Closed => {
-                                    richat_client::error::ReceiveError::Closed
-                                }
-                            })
-                    })
-                    .boxed()
+                // Parse directly in the SHM reader thread, eliminating one
+                // channel hop and tokio::spawn compared to other transports.
+                let rx = sub.subscribe_map(channel_size, move |data| {
+                    match Message::parse(data.into(), parser) {
+                        Ok(message) => Some(Ok((name, message))),
+                        Err(MessageParseError::InvalidUpdateMessage("Ping")) => None,
+                        Err(error) => Some(Err(error.into())),
+                    }
+                });
+                info!(name, "subscribed");
+                return Ok(rx.to_async());
             }
         };
         info!(name, "subscribed");

@@ -11,10 +11,12 @@ keywords = { workspace = true }
 publish = true
 
 [dependencies]
+affinity-linux = { workspace = true }
 bytes = { workspace = true }
 foldhash = { workspace = true }
 futures = { workspace = true }
 humantime-serde = { workspace = true }
+kanal = { workspace = true }
 memmap2 = { workspace = true }
 pin-project-lite = { workspace = true }
 prost = { workspace = true }
