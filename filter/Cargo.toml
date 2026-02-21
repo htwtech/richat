@@ -1,0 +1,37 @@
+[package]
+name = "richat-filter"
+version = "8.1.0"
+authors = { workspace = true }
+edition = { workspace = true }
+description = "Richat Filters"
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+keywords = { workspace = true }
+publish = true
+
+[dependencies]
+arrayvec = { workspace = true }
+base64 = { workspace = true }
+bs58 = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+richat-proto = { workspace = true }
+richat-shared = { workspace = true, features = ["config", "five8"] }
+serde = { workspace = true, features = ["derive"] }
+smallvec = { workspace = true }
+solana-account = { workspace = true }
+solana-clock = { workspace = true }
+solana-commitment-config = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-signature = { workspace = true }
+solana-transaction-status = { workspace = true }
+spl-token-2022-interface = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+const-hex = { workspace = true }
+maplit = { workspace = true }
+
+[lints]
+workspace = true

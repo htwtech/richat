@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package richat;
+
+message RichatFilter {
+  bool disable_accounts = 1;
+  bool disable_transactions = 2;
+  bool disable_entries = 3;
+}
+
+message GrpcSubscribeRequest {
+  optional uint64 replay_from_slot = 11; // Same tag as in Yellowstone gRPC SubscribeRequest
+  RichatFilter filter = 100;
+}
+
+message QuicSubscribeRequest {
+  optional bytes x_token = 1;
+  uint32 recv_streams = 2;
+  optional uint32 max_backlog = 3;
+  optional uint64 replay_from_slot = 4;
+  RichatFilter filter = 5;
+}
+
+message QuicSubscribeResponse {
+  optional QuicSubscribeResponseError error = 1;
+  optional uint32 max_recv_streams = 2;
+  optional uint64 first_available_slot = 3;
+  string version = 4;
+}
+
+enum QuicSubscribeResponseError {
+  ZERO_RECV_STREAMS = 0;
+  EXCEED_RECV_STREAMS = 1;
+  NOT_INITIALIZED = 2;
+  SLOT_NOT_AVAILABLE = 3;
+  REQUEST_SIZE_TOO_LARGE = 4;
+  X_TOKEN_REQUIRED = 5;
+  X_TOKEN_INVALID = 6;
+}
+
+message QuicSubscribeClose {
+  QuicSubscribeCloseError error = 1;
+}
+
+enum QuicSubscribeCloseError {
+  LAGGED = 0;
+  CLOSED = 1;
+}
+
+message SubscribeAccountsRequest {
+  optional int32 ping = 1;
+  optional uint64 from_slot = 2;
+  string filter = 3;
+  repeated bytes add = 4;
+  repeated bytes remove = 5;
+}

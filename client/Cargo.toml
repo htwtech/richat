@@ -1,0 +1,41 @@
+[package]
+name = "richat-client"
+version = "8.1.1"
+authors = { workspace = true }
+edition = { workspace = true }
+description = "Richat Client Library"
+homepage = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+keywords = { workspace = true }
+publish = true
+
+[dependencies]
+bytes = { workspace = true }
+foldhash = { workspace = true }
+futures = { workspace = true }
+humantime-serde = { workspace = true }
+memmap2 = { workspace = true }
+pin-project-lite = { workspace = true }
+prost = { workspace = true }
+quinn = { workspace = true }
+richat-proto = { workspace = true }
+richat-shared = { workspace = true, features = ["config", "transports"] }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+solana-clock = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tonic = { workspace = true, features = ["tls-native-roots"] }
+tonic-prost = { workspace = true }
+tracing = { workspace = true }
+webpki-roots = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+tonic-build = { workspace = true }
+
+[lints]
+workspace = true

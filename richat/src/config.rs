@@ -1,0 +1,406 @@
+use {
+    crate::{
+        grpc::config::ConfigAppsGrpc, pubsub::config::ConfigAppsPubsub,
+        richat::config::ConfigAppsRichat,
+    },
+    futures::future::{TryFutureExt, ready, try_join_all},
+    richat_client::{grpc::ConfigGrpcClient, quic::ConfigQuicClient, shm::ConfigShmClient},
+    richat_filter::message::MessageParserEncoding,
+    richat_metrics::ConfigMetrics,
+    richat_shared::{
+        config::{
+            ConfigTokio, deserialize_affinity, deserialize_humansize_usize, deserialize_num_str,
+        },
+        tracing::ConfigTracing,
+    },
+    rocksdb::DBCompressionType,
+    serde::{
+        Deserialize,
+        de::{self, Deserializer},
+    },
+    std::{collections::HashSet, path::PathBuf, thread::Builder},
+    tokio::time::{Duration, sleep},
+    tokio_util::sync::CancellationToken,
+};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default)]
+    pub logs: ConfigTracing,
+    #[serde(default)]
+    pub metrics: Option<ConfigMetrics>,
+    pub channel: ConfigChannel,
+    #[serde(default)]
+    pub apps: ConfigApps,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigChannel {
+    /// Runtime for receiving plugin messages
+    #[serde(default)]
+    pub tokio: ConfigTokio,
+    #[serde(default)]
+    pub sources_sighup_reload: bool,
+    #[serde(deserialize_with = "ConfigChannel::deserialize_sources")]
+    pub sources: Vec<ConfigChannelSource>,
+    #[serde(default)]
+    pub config: ConfigChannelInner,
+}
+
+impl ConfigChannel {
+    pub fn get_messages_parser(&self) -> MessageParserEncoding {
+        if let Some(source) = self.sources.first() {
+            return match source {
+                ConfigChannelSource::Quic { general, .. } => general.parser,
+                ConfigChannelSource::Grpc { general, .. } => general.parser,
+                ConfigChannelSource::Shm { general, .. } => general.parser,
+            };
+        }
+        unreachable!("deserialize should check sources")
+    }
+
+    pub fn ensure_sources_have_reconnect(&self) -> anyhow::Result<()> {
+        for source in &self.sources {
+            let has_reconnect = match source {
+                ConfigChannelSource::Quic { general, .. } => general.reconnect.is_some(),
+                ConfigChannelSource::Grpc { general, .. } => general.reconnect.is_some(),
+                ConfigChannelSource::Shm { general, .. } => general.reconnect.is_some(),
+            };
+            anyhow::ensure!(
+                has_reconnect,
+                "source '{}' must have reconnect configured for SIGHUP reload",
+                source.name()
+            );
+        }
+        Ok(())
+    }
+
+    fn deserialize_sources<'de, D>(deserializer: D) -> Result<Vec<ConfigChannelSource>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let sources = Vec::<ConfigChannelSource>::deserialize(deserializer)?;
+        if sources.is_empty() {
+            return Err(de::Error::custom("at least one source should be used"));
+        }
+
+        let mut names = HashSet::new();
+        let mut parsers = HashSet::new();
+        for source in sources.iter() {
+            match source {
+                ConfigChannelSource::Quic { general, .. } => {
+                    names.insert(&general.name);
+                    parsers.insert(general.parser);
+                }
+                ConfigChannelSource::Grpc { general, .. } => {
+                    names.insert(&general.name);
+                    parsers.insert(general.parser);
+                }
+                ConfigChannelSource::Shm { general, .. } => {
+                    names.insert(&general.name);
+                    parsers.insert(general.parser);
+                }
+            }
+        }
+
+        if names.len() != sources.len() {
+            return Err(de::Error::custom(
+                "only unique name for sources can be used",
+            ));
+        }
+
+        if parsers.len() != 1 {
+            return Err(de::Error::custom(format!(
+                "multiple messages parsers: {parsers:?} (only same parser can be used)"
+            )));
+        }
+
+        Ok(sources)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, tag = "transport")]
+pub enum ConfigChannelSource {
+    #[serde(rename = "quic")]
+    Quic {
+        #[serde(flatten)]
+        general: ConfigChannelSourceGeneral,
+        #[serde(flatten)]
+        config: ConfigQuicClient,
+    },
+    #[serde(rename = "grpc")]
+    Grpc {
+        #[serde(flatten)]
+        general: ConfigChannelSourceGeneral,
+        source: ConfigGrpcClientSource,
+        #[serde(flatten)]
+        config: ConfigGrpcClient,
+    },
+    #[serde(rename = "shm")]
+    Shm {
+        #[serde(flatten)]
+        general: ConfigChannelSourceGeneral,
+        #[serde(flatten)]
+        config: ConfigShmClient,
+    },
+}
+
+impl ConfigChannelSource {
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Quic { general, .. } => &general.name,
+            Self::Grpc { general, .. } => &general.name,
+            Self::Shm { general, .. } => &general.name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ConfigChannelSourceGeneral {
+    pub name: String,
+    /// Messages parser: `prost` or `limited`
+    pub parser: MessageParserEncoding,
+    #[serde(default)]
+    pub disable_accounts: bool,
+    #[serde(default)]
+    pub reconnect: Option<ConfigChannelSourceReconnect>,
+    #[serde(default = "ConfigChannelSourceGeneral::default_channel_size")]
+    pub channel_size: usize,
+}
+
+impl ConfigChannelSourceGeneral {
+    const fn default_channel_size() -> usize {
+        16_384
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ConfigChannelSourceReconnect {
+    #[serde(
+        with = "humantime_serde",
+        default = "ConfigChannelSourceReconnect::default_initial_interval"
+    )]
+    pub initial_interval: Duration,
+    #[serde(
+        with = "humantime_serde",
+        default = "ConfigChannelSourceReconnect::default_max_interval"
+    )]
+    pub max_interval: Duration,
+    #[serde(default = "ConfigChannelSourceReconnect::default_multiplier")]
+    pub multiplier: f64,
+}
+
+impl ConfigChannelSourceReconnect {
+    const fn default_initial_interval() -> Duration {
+        Duration::from_secs(1)
+    }
+
+    const fn default_max_interval() -> Duration {
+        Duration::from_secs(15)
+    }
+
+    const fn default_multiplier() -> f64 {
+        2.0
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum ConfigGrpcClientSource {
+    DragonsMouth,
+    #[default]
+    Richat,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigChannelInner {
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub max_messages: usize,
+    #[serde(deserialize_with = "deserialize_humansize_usize")]
+    pub max_bytes: usize,
+    pub storage: Option<ConfigStorage>,
+}
+
+impl Default for ConfigChannelInner {
+    fn default() -> Self {
+        Self {
+            max_messages: 2_097_152, // aligned to power of 2, ~20k/slot should give us ~100 slots
+            max_bytes: 15 * 1024 * 1024 * 1024, // 15GiB with ~150MiB/slot should give us ~100 slots
+            storage: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigStorage {
+    pub path: PathBuf,
+    #[serde(
+        default = "ConfigStorage::default_max_slots",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub max_slots: usize,
+    #[serde(default, deserialize_with = "deserialize_affinity")]
+    pub serialize_affinity: Option<Vec<usize>>,
+    #[serde(default, deserialize_with = "deserialize_affinity")]
+    pub write_affinity: Option<Vec<usize>>,
+    #[serde(default)]
+    pub messages_compression: ConfigStorageRocksdbCompression,
+    #[serde(
+        default = "ConfigStorage::default_replay_channel_capacity",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub replay_inflight_max: usize,
+    #[serde(
+        default = "ConfigStorage::default_replay_threads",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub replay_threads: usize,
+    #[serde(default, deserialize_with = "deserialize_affinity")]
+    pub replay_affinity: Option<Vec<usize>>,
+    #[serde(
+        default = "ConfigStorage::default_replay_decode_per_tick",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub replay_decode_per_tick: usize,
+}
+
+impl ConfigStorage {
+    const fn default_max_slots() -> usize {
+        1024
+    }
+
+    const fn default_replay_channel_capacity() -> usize {
+        1024
+    }
+
+    const fn default_replay_threads() -> usize {
+        4
+    }
+
+    const fn default_replay_decode_per_tick() -> usize {
+        256
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
+pub enum ConfigStorageRocksdbCompression {
+    #[default]
+    None,
+    Snappy,
+    Zlib,
+    Bz2,
+    Lz4,
+    Lz4hc,
+    Zstd,
+}
+
+impl From<ConfigStorageRocksdbCompression> for DBCompressionType {
+    fn from(value: ConfigStorageRocksdbCompression) -> Self {
+        match value {
+            ConfigStorageRocksdbCompression::None => Self::None,
+            ConfigStorageRocksdbCompression::Snappy => Self::Snappy,
+            ConfigStorageRocksdbCompression::Zlib => Self::Zlib,
+            ConfigStorageRocksdbCompression::Bz2 => Self::Bz2,
+            ConfigStorageRocksdbCompression::Lz4 => Self::Lz4,
+            ConfigStorageRocksdbCompression::Lz4hc => Self::Lz4hc,
+            ConfigStorageRocksdbCompression::Zstd => Self::Zstd,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigApps {
+    /// Runtime for incoming connections
+    pub tokio: ConfigTokio,
+    /// downstream richat
+    pub richat: Option<ConfigAppsRichat>,
+    /// gRPC app (fully compatible with Yellowstone Dragon's Mouth)
+    pub grpc: Option<ConfigAppsGrpc>,
+    /// WebSocket app (fully compatible with Solana PubSub)
+    pub pubsub: Option<ConfigAppsPubsub>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigAppsWorkers {
+    /// Number of worker threads
+    pub threads: usize,
+    /// Threads affinity
+    #[serde(deserialize_with = "deserialize_affinity")]
+    pub affinity: Option<Vec<usize>>,
+}
+
+impl Default for ConfigAppsWorkers {
+    fn default() -> Self {
+        Self {
+            threads: 1,
+            affinity: None,
+        }
+    }
+}
+
+impl ConfigAppsWorkers {
+    pub async fn run(
+        self,
+        get_name: impl Fn(usize) -> String,
+        spawn_fn: impl FnOnce(usize) -> anyhow::Result<()> + Clone + Send + 'static,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.threads > 0, "number of threads can be zero");
+
+        let mut jhs = Vec::with_capacity(self.threads);
+        for index in 0..self.threads {
+            let cpus = self.affinity.as_ref().map(|affinity| {
+                if self.threads == affinity.len() {
+                    vec![affinity[index]]
+                } else {
+                    affinity.clone()
+                }
+            });
+
+            jhs.push(Self::run_once(
+                index,
+                get_name(index),
+                cpus,
+                spawn_fn.clone(),
+                shutdown.clone(),
+            )?);
+        }
+
+        try_join_all(jhs).await.map(|_| ())
+    }
+
+    pub fn run_once(
+        index: usize,
+        name: String,
+        cpus: Option<Vec<usize>>,
+        spawn_fn: impl FnOnce(usize) -> anyhow::Result<()> + Send + 'static,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>>> {
+        let th = Builder::new().name(name).spawn(move || {
+            if let Some(cpus) = cpus {
+                affinity_linux::set_thread_affinity(cpus.into_iter())
+                    .expect("failed to set affinity");
+            }
+            spawn_fn(index)
+        })?;
+
+        let jh = tokio::spawn(async move {
+            while !th.is_finished() {
+                let ms = if shutdown.is_cancelled() { 10 } else { 2_000 };
+                sleep(Duration::from_millis(ms)).await;
+            }
+            th.join().expect("failed to join thread")
+        });
+
+        Ok(jh.map_err(anyhow::Error::new).and_then(ready))
+    }
+}
