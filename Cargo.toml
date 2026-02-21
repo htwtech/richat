@@ -130,3 +130,4 @@ trivially_copy_pass_by_ref = "deny"
 [profile.release]
 lto = true
 codegen-units = 1
+opt-level = 3
