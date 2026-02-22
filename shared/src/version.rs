@@ -32,12 +32,20 @@ pub struct GrpcVersionInfo<'a> {
 
 impl<'a> GrpcVersionInfo<'a> {
     pub fn new(version: Version<'a>) -> Self {
+        let show_hostname = match option_env!("RICHAT_DISPLAY_HOSTNAME") {
+            Some("false" | "0") => false,
+            _ => true,
+        };
         Self {
             version,
             extra: GrpcVersionInfoExtra {
-                hostname: hostname::get()
-                    .ok()
-                    .and_then(|name| name.into_string().ok()),
+                hostname: if show_hostname {
+                    hostname::get()
+                        .ok()
+                        .and_then(|name| name.into_string().ok())
+                } else {
+                    None
+                },
             },
         }
     }

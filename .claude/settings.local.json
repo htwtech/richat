@@ -6,7 +6,9 @@
       "Bash(xxd:*)",
       "Bash(rsync:*)",
       "Bash(tar czf:*)",
-      "Bash(scp:*)"
+      "Bash(scp:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

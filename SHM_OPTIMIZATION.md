@@ -25,36 +25,48 @@ SHM eliminates network stack entirely. The data goes: mmap write -> page cache -
 ## Data Flow
 
 ```
-┌──────────────────────┐
-│   Solana Validator    │
-│                       │
-│   plugin-agave        │  Geyser plugin encodes messages to protobuf,
-│   (Geyser Plugin)     │  pushes to in-memory ring buffer
-│         │             │
-│         ▼             │
-│   SHM Server          │  Subscribes to ring buffer,
-│   (writer thread)     │  writes protobuf bytes to mmap
-│         │             │
-│         ▼             │
-│   /dev/shm/richat     │  Memory-mapped file on tmpfs
-└─────────┬────────────┘
-          │ (OS page cache, no copy between processes)
-          │
-┌─────────▼────────────┐   ┌─────────────────────┐   ┌──────────────────┐
-│ richat instance #1    │   │ richat instance #2   │   │ richat instance N │
-│                       │   │                      │   │                   │
-│ shm-reader thread     │   │ shm-reader thread    │   │ shm-reader thread │
-│   read-only mmap      │   │   read-only mmap     │   │   read-only mmap  │
-│   parse protobuf      │   │   parse protobuf     │   │   parse protobuf  │
-│         │             │   │         │            │   │         │         │
-│         ▼             │   │         ▼            │   │         ▼         │
-│ Sender -> gRPC/QUIC   │   │ Sender -> gRPC/QUIC  │   │ Sender -> ...     │
-│ (serve to clients)    │   │ (serve to clients)   │   │                   │
-└───────────────────────┘   └──────────────────────┘   └──────────────────┘
+┌──────────────────────────┐
+│     Solana Validator      │
+│                           │
+│   plugin-agave            │  Geyser plugin encodes messages
+│   (Geyser Plugin)         │  to protobuf, pushes to ring buffer
+│         │                 │
+│         ▼                 │
+│   SHM Writer Thread       │  Writes protobuf bytes to mmap
+│         │                 │
+│         ▼                 │
+│   /dev/shm/richat         │  Memory-mapped file on tmpfs
+│   (ring buffer, 16 GiB)  │
+└────┬────────┬────────┬────┘
+     │        │        │
+     │  same physical pages (OS page cache)
+     │  no copies between processes
+     │        │        │
+     │   mmap read-only │
+     │        │        │
+┌────▼───┐ ┌──▼─────┐ ┌▼───────┐
+│richat 1│ │richat 2│ │richat N│   N independent processes,
+│        │ │        │ │        │   each opens the SAME file
+│ shm-   │ │ shm-   │ │ shm-   │   with mmap(MAP_PRIVATE,
+│ reader │ │ reader │ │ reader │   PROT_READ)
+│   │    │ │   │    │ │   │    │
+│   ▼    │ │   ▼    │ │   ▼    │
+│ parse  │ │ parse  │ │ parse  │   protobuf decode in
+│ proto  │ │ proto  │ │ proto  │   reader thread
+│   │    │ │   │    │ │   │    │
+│   ▼    │ │   ▼    │ │   ▼    │
+│ gRPC/  │ │ gRPC/  │ │ gRPC/  │   encode & serve
+│ QUIC   │ │ QUIC   │ │ QUIC   │   to remote clients
+│ serve  │ │ serve  │ │ serve  │
+└────────┘ └────────┘ └────────┘
+     │          │          │
+     ▼          ▼          ▼
+  clients    clients    clients
 ```
 
-Multiple richat instances read the same mmap file concurrently.
-Each instance then fans out to its own gRPC/QUIC/WebSocket clients.
+All richat instances mmap the same `/dev/shm/richat` file read-only.
+The OS maps identical physical RAM pages into each process — zero-copy.
+Each instance independently parses and serves its own gRPC/QUIC clients.
 
 ## mmap File Layout
 
