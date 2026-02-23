@@ -165,6 +165,186 @@ impl ProtobufMessage<'_> {
         .encode_to_vec()
     }
 
+    pub fn encode_into(&self, encoder: ProtobufEncoder, buf: &mut Vec<u8>) {
+        self.encode_into_with_timestamp(encoder, SystemTime::now(), buf)
+    }
+
+    pub fn encode_into_with_timestamp(
+        &self,
+        encoder: ProtobufEncoder,
+        created_at: impl Into<Timestamp>,
+        buf: &mut Vec<u8>,
+    ) {
+        match encoder {
+            ProtobufEncoder::Prost => self.encode_prost_into(created_at, buf),
+            ProtobufEncoder::Raw => self.encode_raw_into(created_at, buf),
+        }
+    }
+
+    pub fn encode_prost_into(&self, created_at: impl Into<Timestamp>, buf: &mut Vec<u8>) {
+        use {
+            prost::Message,
+            richat_proto::{
+                convert_to,
+                geyser::{
+                    SlotStatus, SubscribeUpdate, SubscribeUpdateAccount,
+                    SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
+                    SubscribeUpdateSlot, SubscribeUpdateTransaction,
+                    SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
+                },
+            },
+        };
+
+        let update = SubscribeUpdate {
+            filters: Vec::new(),
+            update_oneof: Some(match self {
+                Self::Account { slot, account } => UpdateOneof::Account(SubscribeUpdateAccount {
+                    account: Some(SubscribeUpdateAccountInfo {
+                        pubkey: account.pubkey.to_vec(),
+                        lamports: account.lamports,
+                        owner: account.owner.to_vec(),
+                        executable: account.executable,
+                        rent_epoch: account.rent_epoch,
+                        data: account.data.to_vec(),
+                        write_version: account.write_version,
+                        txn_signature: account
+                            .txn
+                            .as_ref()
+                            .map(|transaction| transaction.signature().as_ref().to_vec()),
+                    }),
+                    slot: *slot,
+                    is_startup: false,
+                }),
+                Self::Slot {
+                    slot,
+                    parent,
+                    status,
+                } => UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot: *slot,
+                    parent: *parent,
+                    status: match status {
+                        GeyserSlotStatus::Processed => SlotStatus::SlotProcessed,
+                        GeyserSlotStatus::Rooted => SlotStatus::SlotFinalized,
+                        GeyserSlotStatus::Confirmed => SlotStatus::SlotConfirmed,
+                        GeyserSlotStatus::FirstShredReceived => SlotStatus::SlotFirstShredReceived,
+                        GeyserSlotStatus::Completed => SlotStatus::SlotCompleted,
+                        GeyserSlotStatus::CreatedBank => SlotStatus::SlotCreatedBank,
+                        GeyserSlotStatus::Dead(_) => SlotStatus::SlotDead,
+                    } as i32,
+                    dead_error: if let GeyserSlotStatus::Dead(error) = status {
+                        Some(error.clone())
+                    } else {
+                        None
+                    },
+                }),
+                Self::Transaction { slot, transaction } => {
+                    UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                        transaction: Some(SubscribeUpdateTransactionInfo {
+                            signature: transaction.signature.as_ref().to_vec(),
+                            is_vote: transaction.is_vote,
+                            transaction: Some(convert_to::create_transaction(
+                                transaction.transaction,
+                            )),
+                            meta: Some(convert_to::create_transaction_meta(
+                                transaction.transaction_status_meta,
+                            )),
+                            index: transaction.index as u64,
+                        }),
+                        slot: *slot,
+                    })
+                }
+                Self::BlockMeta { blockinfo } => UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                    slot: blockinfo.slot,
+                    blockhash: blockinfo.blockhash.to_string(),
+                    rewards: Some(convert_to::create_rewards_obj(
+                        &blockinfo.rewards.rewards,
+                        blockinfo.rewards.num_partitions,
+                    )),
+                    block_time: blockinfo.block_time.map(convert_to::create_timestamp),
+                    block_height: blockinfo.block_height.map(convert_to::create_block_height),
+                    parent_slot: blockinfo.parent_slot,
+                    parent_blockhash: blockinfo.parent_blockhash.to_string(),
+                    executed_transaction_count: blockinfo.executed_transaction_count,
+                    entries_count: blockinfo.entry_count,
+                }),
+                Self::Entry { entry } => UpdateOneof::Entry(SubscribeUpdateEntry {
+                    slot: entry.slot,
+                    index: entry.index as u64,
+                    num_hashes: entry.num_hashes,
+                    hash: entry.hash.to_vec(),
+                    executed_transaction_count: entry.executed_transaction_count,
+                    starting_transaction_index: entry.starting_transaction_index as u64,
+                }),
+            }),
+            created_at: Some(created_at.into()),
+        };
+        buf.clear();
+        buf.reserve(update.encoded_len());
+        update.encode(buf).expect("sufficient capacity");
+    }
+
+    pub fn encode_raw_into(&self, created_at: impl Into<Timestamp>, buf: &mut Vec<u8>) {
+        let created_at = created_at.into();
+
+        let size = match self {
+            Self::Account { slot, account } => {
+                let account = encoding::Account::new(*slot, account);
+                message::encoded_len(2, &account)
+            }
+            Self::Slot {
+                slot,
+                parent,
+                status,
+            } => {
+                let slot = encoding::Slot::new(*slot, *parent, status);
+                message::encoded_len(3, &slot)
+            }
+            Self::Transaction { slot, transaction } => {
+                let transaction = encoding::Transaction::new(*slot, transaction);
+                message::encoded_len(4, &transaction)
+            }
+            Self::BlockMeta { blockinfo } => {
+                let blockmeta = encoding::BlockMeta::new(blockinfo);
+                message::encoded_len(7, &blockmeta)
+            }
+            Self::Entry { entry } => {
+                let entry = encoding::Entry::new(entry);
+                message::encoded_len(8, &entry)
+            }
+        } + message::encoded_len(11, &created_at);
+
+        buf.clear();
+        buf.reserve(size);
+
+        match self {
+            Self::Account { slot, account } => {
+                let account = encoding::Account::new(*slot, account);
+                message::encode(2, &account, buf)
+            }
+            Self::Slot {
+                slot,
+                parent,
+                status,
+            } => {
+                let slot = encoding::Slot::new(*slot, *parent, status);
+                message::encode(3, &slot, buf)
+            }
+            Self::Transaction { slot, transaction } => {
+                let transaction = encoding::Transaction::new(*slot, transaction);
+                message::encode(4, &transaction, buf)
+            }
+            Self::BlockMeta { blockinfo } => {
+                let blockmeta = encoding::BlockMeta::new(blockinfo);
+                message::encode(7, &blockmeta, buf)
+            }
+            Self::Entry { entry } => {
+                let entry = encoding::Entry::new(entry);
+                message::encode(8, &entry, buf)
+            }
+        }
+        message::encode(11, &created_at, buf);
+    }
+
     pub fn encode_raw(&self, created_at: impl Into<Timestamp>) -> Vec<u8> {
         let created_at = created_at.into();
 

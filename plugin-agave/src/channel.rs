@@ -64,9 +64,25 @@ impl Sender {
     }
 
     pub fn push(&self, message: ProtobufMessage, encoder: ProtobufEncoder) {
-        // encode message
         let data = message.encode(encoder);
+        self.push_inner(message, data, encoder);
+    }
 
+    pub fn push_pre_encoded(
+        &self,
+        message: ProtobufMessage,
+        data: Vec<u8>,
+        encoder: ProtobufEncoder,
+    ) {
+        self.push_inner(message, data, encoder);
+    }
+
+    fn push_inner(
+        &self,
+        message: ProtobufMessage,
+        data: Vec<u8>,
+        encoder: ProtobufEncoder,
+    ) {
         // acquire state lock
         let mut state = self.shared.state_lock();
 

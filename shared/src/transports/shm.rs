@@ -8,11 +8,14 @@ use {
     richat_proto::richat::RichatFilter,
     serde::Deserialize,
     std::{
-        fs::{self, OpenOptions},
+        fs::{self, File, OpenOptions},
         future::Future,
         io,
         path::PathBuf,
-        sync::atomic::{AtomicI64, AtomicU64, Ordering},
+        sync::{
+            atomic::{AtomicI64, AtomicU64, Ordering},
+            Mutex,
+        },
         time::Duration,
     },
     thiserror::Error,
@@ -208,6 +211,181 @@ const fn next_power_of_two(n: usize) -> usize {
     n.next_power_of_two()
 }
 
+/// Create the SHM file, mmap it, and initialize the header + index entries.
+/// Returns `(mmap, file, idx_capacity, data_capacity)`.
+fn init_shm_mmap(
+    config: &ConfigShmServer,
+) -> Result<(MmapMut, File, usize, usize), ShmError> {
+    let idx_capacity = next_power_of_two(config.max_messages);
+    let data_capacity = next_power_of_two(config.max_bytes);
+    let total_size = HEADER_SIZE + idx_capacity * INDEX_ENTRY_SIZE + data_capacity;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&config.path)
+        .map_err(ShmError::CreateFile)?;
+
+    file.set_len(total_size as u64).map_err(ShmError::SetLen)?;
+
+    // SAFETY: we just created and sized the file, we are the sole writer
+    let mut mmap = unsafe { MmapMut::map_mut(&file).map_err(ShmError::Mmap)? };
+
+    // Initialize header
+    let ptr = mmap.as_mut_ptr();
+    // SAFETY: ptr is valid, aligned (start of mmap), and we have exclusive access
+    unsafe {
+        let header = ShmHeader::from_ptr_mut(ptr);
+        header.magic = MAGIC;
+        header.version = VERSION;
+        header.idx_capacity = idx_capacity as u64;
+        header.data_capacity = data_capacity as u64;
+        header.tail = AtomicU64::new(0);
+        header.data_tail = AtomicU64::new(0);
+        header.closed = AtomicU64::new(0);
+        header._reserved = 0;
+    }
+
+    // Initialize index entries: all seq = -1
+    for i in 0..idx_capacity {
+        // SAFETY: index region is within mmap bounds
+        unsafe {
+            let entry_ptr = ptr.add(HEADER_SIZE + i * INDEX_ENTRY_SIZE);
+            let entry = ShmIndexEntry::from_ptr_mut(entry_ptr);
+            entry.seq = AtomicI64::new(-1);
+            entry.data_off = 0;
+            entry.data_len = 0;
+            entry._reserved = 0;
+            entry.slot = 0;
+        }
+    }
+
+    Ok((mmap, file, idx_capacity, data_capacity))
+}
+
+// --- ShmDirectWriter ---
+
+struct ShmDirectWriterInner {
+    mmap: MmapMut,
+    pos: u64,
+    data_pos: u64,
+    idx_capacity: usize,
+    data_capacity: usize,
+    idx_mask: u64,
+    closed: bool,
+}
+
+/// Direct writer into the SHM ring buffer, bypassing async channels.
+/// Thread-safe via Mutex (Geyser callbacks come from different threads).
+pub struct ShmDirectWriter {
+    inner: Mutex<ShmDirectWriterInner>,
+    path: PathBuf,
+    _file: File,
+}
+
+impl std::fmt::Debug for ShmDirectWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmDirectWriter")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+impl ShmDirectWriter {
+    /// Create and initialize the SHM file.
+    pub fn new(config: &ConfigShmServer) -> Result<Self, ShmError> {
+        let (mmap, file, idx_capacity, data_capacity) = init_shm_mmap(config)?;
+        let idx_mask = (idx_capacity - 1) as u64;
+        let path = config.path.clone();
+
+        info!(path = %path.display(), idx_capacity, data_capacity, "shm direct writer started");
+
+        Ok(Self {
+            inner: Mutex::new(ShmDirectWriterInner {
+                mmap,
+                pos: 0,
+                data_pos: 0,
+                idx_capacity,
+                data_capacity,
+                idx_mask,
+                closed: false,
+            }),
+            path,
+            _file: file,
+        })
+    }
+
+    /// Write bytes into the ring buffer. `slot` is the Solana slot for the index entry.
+    #[inline]
+    pub fn write(&self, data: &[u8], slot: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.closed {
+            return;
+        }
+
+        let ptr = inner.mmap.as_mut_ptr();
+        let data_len = data.len();
+        let idx = (inner.pos & inner.idx_mask) as usize;
+        let data_base_offset = HEADER_SIZE + inner.idx_capacity * INDEX_ENTRY_SIZE;
+
+        // 1. Write data bytes into data ring with wrap-around
+        let data_ring_offset = (inner.data_pos % inner.data_capacity as u64) as usize;
+        // SAFETY: data region is within mmap bounds, we are the sole writer (protected by Mutex)
+        let data_ring = unsafe {
+            std::slice::from_raw_parts_mut(ptr.add(data_base_offset), inner.data_capacity)
+        };
+        copy_to_ring(data_ring, data_ring_offset, data);
+
+        // 2. Write index entry metadata
+        // SAFETY: index region is within bounds
+        let entry = unsafe {
+            ShmIndexEntry::from_ptr_mut(
+                ptr.add(HEADER_SIZE + idx * INDEX_ENTRY_SIZE),
+            )
+        };
+        entry.data_off = inner.data_pos;
+        entry.data_len = data_len as u32;
+        entry.slot = slot;
+
+        // 3. Advance data position
+        inner.data_pos += data_len as u64;
+
+        // 4. Update header.data_tail
+        let header = unsafe { ShmHeader::from_ptr(ptr) };
+        header.data_tail.store(inner.data_pos, Ordering::Relaxed);
+
+        // 5. COMMIT: set seq to pos
+        entry.seq.store(inner.pos as i64, Ordering::Release);
+
+        // 6. Advance position
+        inner.pos += 1;
+
+        // 7. Update header.tail
+        header.tail.store(inner.pos, Ordering::Release);
+    }
+
+    /// Mark SHM as closed.
+    pub fn close(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.closed {
+            return;
+        }
+        inner.closed = true;
+        let ptr = inner.mmap.as_mut_ptr();
+        let header = unsafe { ShmHeader::from_ptr(ptr) };
+        header.closed.store(1, Ordering::Release);
+    }
+
+    /// Remove the SHM file from disk.
+    pub fn remove_file(&self) {
+        if let Err(error) = fs::remove_file(&self.path) {
+            error!(path = %self.path.display(), %error, "failed to remove shm file");
+        }
+    }
+}
+
 pub struct ShmServer;
 
 /// A Send-safe wrapper around MmapMut.
@@ -224,55 +402,8 @@ impl ShmServer {
         messages: impl Subscribe + Send + 'static,
         shutdown: CancellationToken,
     ) -> Result<impl Future<Output = Result<(), JoinError>>, ShmError> {
-        let idx_capacity = next_power_of_two(config.max_messages);
-        let data_capacity = next_power_of_two(config.max_bytes);
+        let (mmap, file, idx_capacity, data_capacity) = init_shm_mmap(&config)?;
         let idx_mask = (idx_capacity - 1) as u64;
-
-        let total_size = HEADER_SIZE + idx_capacity * INDEX_ENTRY_SIZE + data_capacity;
-
-        // Create and size the file
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&config.path)
-            .map_err(ShmError::CreateFile)?;
-
-        file.set_len(total_size as u64).map_err(ShmError::SetLen)?;
-
-        // mmap the file
-        // SAFETY: we just created and sized the file, we are the sole writer
-        let mut mmap = unsafe { MmapMut::map_mut(&file).map_err(ShmError::Mmap)? };
-
-        // Initialize header
-        let ptr = mmap.as_mut_ptr();
-        // SAFETY: ptr is valid, aligned (start of mmap), and we have exclusive access
-        unsafe {
-            let header = ShmHeader::from_ptr_mut(ptr);
-            header.magic = MAGIC;
-            header.version = VERSION;
-            header.idx_capacity = idx_capacity as u64;
-            header.data_capacity = data_capacity as u64;
-            header.tail = AtomicU64::new(0);
-            header.data_tail = AtomicU64::new(0);
-            header.closed = AtomicU64::new(0);
-            header._reserved = 0;
-        }
-
-        // Initialize index entries: all seq = -1
-        for i in 0..idx_capacity {
-            // SAFETY: index region is within mmap bounds
-            unsafe {
-                let entry_ptr = ptr.add(HEADER_SIZE + i * INDEX_ENTRY_SIZE);
-                let entry = ShmIndexEntry::from_ptr_mut(entry_ptr);
-                entry.seq = AtomicI64::new(-1);
-                entry.data_off = 0;
-                entry.data_len = 0;
-                entry._reserved = 0;
-                entry.slot = 0;
-            }
-        }
 
         let filter = config.filter.map(RichatFilter::from);
 

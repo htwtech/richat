@@ -7,8 +7,20 @@
       "Bash(rsync:*)",
       "Bash(tar czf:*)",
       "Bash(scp:*)",
+      "Bash(SSH=*)",
+      "Bash($SSH *)",
       "WebSearch",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(ln:*)",
+      "Bash(SSH=\"ssh -p 40102 -i C:/Users/kp6c6/.ssh/bubba.key bubba@104.37.188.2\")",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash($SSH \"cat:*)",
+      "Bash(SSH=\"ssh -p 40102 -i C:/Users/kp6c6/.ssh/bubba.key bubba@138.199.142.171\":*)",
+      "Bash(SSH=\"ssh -p 40102 -i C:/Users/kp6c6/.ssh/bubba.key -o StrictHostKeyChecking=no bubba@138.199.142.171\")",
+      "Bash(git checkout:*)"
     ]
   }
 }

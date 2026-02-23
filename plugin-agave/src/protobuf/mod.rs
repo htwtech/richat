@@ -109,6 +109,98 @@ mod tests {
     }
 
     #[test]
+    pub fn test_encode_into_account() {
+        let created_at = SystemTime::now();
+        let mut buf = Vec::new();
+        for item in generate_accounts() {
+            let (slot, replica) = item.to_replica();
+            let msg = ProtobufMessage::Account {
+                slot,
+                account: &replica,
+            };
+            let expected = msg.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
+            msg.encode_into_with_timestamp(ProtobufEncoder::Prost, created_at, &mut buf);
+            assert_eq!(buf, expected, "encode_into prost account: {item:?}");
+            msg.encode_into_with_timestamp(ProtobufEncoder::Raw, created_at, &mut buf);
+            let expected_raw = msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+            assert_eq!(buf, expected_raw, "encode_into raw account: {item:?}");
+        }
+    }
+
+    #[test]
+    pub fn test_encode_into_block_meta() {
+        let created_at = SystemTime::now();
+        let mut buf = Vec::new();
+        for item in generate_block_metas() {
+            let replica = item.to_replica();
+            let msg = ProtobufMessage::BlockMeta {
+                blockinfo: &replica,
+            };
+            let expected = msg.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
+            msg.encode_into_with_timestamp(ProtobufEncoder::Prost, created_at, &mut buf);
+            assert_eq!(buf, expected, "encode_into prost block_meta: {item:?}");
+            msg.encode_into_with_timestamp(ProtobufEncoder::Raw, created_at, &mut buf);
+            let expected_raw = msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+            assert_eq!(buf, expected_raw, "encode_into raw block_meta: {item:?}");
+        }
+    }
+
+    #[test]
+    pub fn test_encode_into_entry() {
+        let created_at = SystemTime::now();
+        let mut buf = Vec::new();
+        for item in generate_entries() {
+            let replica = item.to_replica();
+            let msg = ProtobufMessage::Entry { entry: &replica };
+            let expected = msg.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
+            msg.encode_into_with_timestamp(ProtobufEncoder::Prost, created_at, &mut buf);
+            assert_eq!(buf, expected, "encode_into prost entry: {item:?}");
+            msg.encode_into_with_timestamp(ProtobufEncoder::Raw, created_at, &mut buf);
+            let expected_raw = msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+            assert_eq!(buf, expected_raw, "encode_into raw entry: {item:?}");
+        }
+    }
+
+    #[test]
+    pub fn test_encode_into_slot() {
+        let created_at = SystemTime::now();
+        let mut buf = Vec::new();
+        for item in generate_slots() {
+            let (slot, parent, status) = item.to_replica();
+            let msg = ProtobufMessage::Slot {
+                slot,
+                parent,
+                status,
+            };
+            let expected = msg.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
+            msg.encode_into_with_timestamp(ProtobufEncoder::Prost, created_at, &mut buf);
+            assert_eq!(buf, expected, "encode_into prost slot: {item:?}");
+            msg.encode_into_with_timestamp(ProtobufEncoder::Raw, created_at, &mut buf);
+            let expected_raw = msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+            assert_eq!(buf, expected_raw, "encode_into raw slot: {item:?}");
+        }
+    }
+
+    #[test]
+    pub fn test_encode_into_transaction() {
+        let created_at = SystemTime::now();
+        let mut buf = Vec::new();
+        for item in generate_transactions() {
+            let (slot, replica) = item.to_replica();
+            let msg = ProtobufMessage::Transaction {
+                slot,
+                transaction: &replica,
+            };
+            let expected = msg.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
+            msg.encode_into_with_timestamp(ProtobufEncoder::Prost, created_at, &mut buf);
+            assert_eq!(buf, expected, "encode_into prost transaction: {item:?}");
+            msg.encode_into_with_timestamp(ProtobufEncoder::Raw, created_at, &mut buf);
+            let expected_raw = msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+            assert_eq!(buf, expected_raw, "encode_into raw transaction: {item:?}");
+        }
+    }
+
+    #[test]
     pub fn test_encode_transaction() {
         let created_at = SystemTime::now();
         for item in generate_transactions() {
