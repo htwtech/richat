@@ -18,6 +18,8 @@ RICHAT_DISPLAY_VERSION="9.0.0-custom" RICHAT_DISPLAY_PACKAGE="my-richat" cargo b
 |---|---|---|
 | `RICHAT_DISPLAY_VERSION` | version in GetVersion | `CARGO_PKG_VERSION` |
 | `RICHAT_DISPLAY_PACKAGE` | package name | `CARGO_PKG_NAME` |
+| `RICHAT_DISPLAY_PROTO` | proto version | `yellowstone-grpc-proto` version from Cargo.lock |
+| `RICHAT_DISPLAY_PROTO_RICHAT` | proto_richat version | `richat-proto` version from Cargo.lock |
 | `RICHAT_DISPLAY_HOSTNAME` | show hostname (`true`/`false`) | `true` |
 
 Defined in `richat/src/version.rs` via `option_env!()`.
