@@ -7,10 +7,6 @@ pub const VERSION: Version = Version {
         Some(v) => v,
         None => env!("YELLOWSTONE_GRPC_PROTO_VERSION"),
     },
-    proto_richat: match option_env!("RICHAT_DISPLAY_PROTO_RICHAT") {
-        Some(v) => v,
-        None => env!("RICHAT_PROTO_VERSION"),
-    },
     solana: env!("SOLANA_SDK_VERSION"),
     git: env!("GIT_VERSION"),
     rustc: env!("VERGEN_RUSTC_SEMVER"),

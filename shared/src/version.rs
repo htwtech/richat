@@ -5,7 +5,6 @@ pub struct Version<'a> {
     pub package: &'a str,
     pub version: &'a str,
     pub proto: &'a str,
-    pub proto_richat: &'a str,
     pub solana: &'a str,
     pub git: &'a str,
     pub rustc: &'a str,
