@@ -26,9 +26,16 @@ pub struct Config {
     pub quic: Option<ConfigQuicServer>,
     pub grpc: Option<ConfigGrpcServer>,
     pub shm: Option<ConfigShmServer>,
+    /// Tokio runtime shutdown timeout in seconds (default: 10)
+    #[serde(default = "Config::default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
 }
 
 impl Config {
+    const fn default_shutdown_timeout_secs() -> u64 {
+        10
+    }
+
     fn load_from_str(config: &str) -> PluginResult<Self> {
         serde_json::from_str(config).map_err(|error| GeyserPluginError::ConfigFileReadError {
             msg: error.to_string(),
@@ -71,8 +78,10 @@ impl Default for ConfigChannel {
     fn default() -> Self {
         Self {
             encoder: ProtobufEncoder::Raw,
-            max_messages: 2_097_152, // aligned to power of 2, ~20k/slot should give us ~100 slots
-            max_bytes: 15 * 1024 * 1024 * 1024, // 15GiB with ~150MiB/slot should give us ~100 slots
+            // 2M messages (~20k/slot → ~100 slots in buffer). Must be power of 2.
+            max_messages: 2_097_152,
+            // 15 GiB (~150 MiB/slot → ~100 slots in buffer).
+            max_bytes: 15 * 1024 * 1024 * 1024,
         }
     }
 }

@@ -135,13 +135,15 @@ impl Subscriptions {
                     .or_default()
                     .insert(*subscription_id, (*commitment, *method));
 
-                self.subscriptions_per_method
+                if let Some(sub) = self
+                    .subscriptions_per_method
                     .get_mut(&(*commitment, *method))
-                    .expect("subscriptions storage inconsistent, subscribe #1")
-                    .get_mut(subscription_id)
-                    .expect("subscriptions storage inconsistent, subscribe #2")
-                    .clients
-                    .insert(client_id);
+                    .and_then(|m| m.get_mut(subscription_id))
+                {
+                    sub.clients.insert(client_id);
+                } else {
+                    tracing::error!("subscriptions storage inconsistent in subscribe: method or subscription_id not found");
+                }
 
                 *subscription_id
             }
@@ -234,47 +236,57 @@ impl Subscriptions {
         client_id: ClientId,
     ) {
         // get subscription info and remove client id
-        let subscriotions = self
+        let Some(subscriotions) = self
             .subscriptions_per_method
             .get_mut(&(commitment, method))
-            .expect("subscriptions storage inconsistent, remove client subscription #1");
-        let subscriotion_info = subscriotions
-            .get_mut(&subscription_id)
-            .expect("subscriptions storage inconsistent, remove client subscription #2");
-        assert!(
-            subscriotion_info.clients.remove(&client_id),
-            "subscriptions storage inconsistent, remove client subscription #3"
-        );
+        else {
+            tracing::error!("subscriptions storage inconsistent: method ({commitment:?},{method:?}) not found in remove_client_subscription");
+            return;
+        };
+        let Some(subscriotion_info) = subscriotions.get_mut(&subscription_id) else {
+            tracing::error!("subscriptions storage inconsistent: subscription_id {subscription_id} not found in remove_client_subscription");
+            return;
+        };
+        if !subscriotion_info.clients.remove(&client_id) {
+            tracing::error!("subscriptions storage inconsistent: client_id {client_id} not found in subscription {subscription_id}");
+        }
 
         // drop subscription if no clients left
         if subscriotion_info.clients.is_empty() {
-            assert!(
-                self.subscriptions
-                    .remove(&subscriotion_info.config_hash)
-                    .is_some(),
-                "subscriptions storage inconsistent, remove client subscription #4"
-            );
+            if self
+                .subscriptions
+                .remove(&subscriotion_info.config_hash)
+                .is_none()
+            {
+                tracing::error!("subscriptions storage inconsistent: config_hash not found when removing empty subscription {subscription_id}");
+            }
             subscriotions.remove(&subscription_id);
         }
     }
 
     fn remove_subscription(&mut self, config_hash: SubscribeConfigHashId) {
-        let (commitment, method, subscription_id) = self
-            .subscriptions
-            .remove(&config_hash)
-            .expect("subscriptions storage inconsistent, remove subscription #1");
-        let subscriotion = self
+        let Some((commitment, method, subscription_id)) =
+            self.subscriptions.remove(&config_hash)
+        else {
+            tracing::error!("subscriptions storage inconsistent: config_hash not found in remove_subscription");
+            return;
+        };
+        let Some(subscriotion) = self
             .subscriptions_per_method
             .get_mut(&(commitment, method))
-            .expect("subscriptions storage inconsistent, remove subscription #2")
-            .remove(&subscription_id)
-            .expect("subscriptions storage inconsistent, remove subscription #3");
+            .and_then(|m| m.remove(&subscription_id))
+        else {
+            tracing::error!("subscriptions storage inconsistent: subscription_id {subscription_id} not found in remove_subscription");
+            return;
+        };
         for client_id in subscriotion.clients {
-            self.subscriptions_per_client
-                .get_mut(&client_id)
-                .expect("subscriptions storage inconsistent, remove subscription #4")
-                .remove(&subscription_id)
-                .expect("subscriptions storage inconsistent, remove subscription #5");
+            if let Some(client_subs) = self.subscriptions_per_client.get_mut(&client_id) {
+                if client_subs.remove(&subscription_id).is_none() {
+                    tracing::error!("subscriptions storage inconsistent: subscription_id {subscription_id} not found for client {client_id} in remove_subscription");
+                }
+            } else {
+                tracing::error!("subscriptions storage inconsistent: client_id {client_id} not found in remove_subscription");
+            }
         }
     }
 }

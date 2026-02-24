@@ -389,10 +389,16 @@ trait SubscribeMessage {
 
 impl SubscribeMessage for &[u8] {
     fn encode(self, buf: &mut EncodeBuf<'_>) {
+        // tonic pre-allocates buf based on encoded_len(), so this should always hold.
+        // If it doesn't, we truncate rather than crashing the process.
         let required = self.len();
         let remaining = buf.remaining_mut();
         if required > remaining {
-            panic!("SubscribeMessage only errors if not enough space");
+            error!(
+                "SubscribeMessage encode: insufficient buffer space ({required} > {remaining}), truncating"
+            );
+            buf.put_slice(&self[..remaining]);
+            return;
         }
         buf.put_slice(self.as_ref());
     }

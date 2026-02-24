@@ -36,7 +36,7 @@ pub const GRPC_SUBSCRIBE_TOTAL: &str = "grpc_subscribe_total"; // x_subscription
 pub const GRPC_SUBSCRIBE_MESSAGES_COUNT_TOTAL: &str = "grpc_subscribe_messages_count_total"; // x_subscription_id, message
 pub const GRPC_SUBSCRIBE_MESSAGES_BYTES_TOTAL: &str = "grpc_subscribe_messages_bytes_total"; // x_subscription_id, message
 pub const GRPC_SUBSCRIBE_CPU_SECONDS_TOTAL: &str = "grpc_subscribe_cpu_seconds_total"; // x_subscription_id
-pub const GRPC_SUBSCRIBE_REPLAY_DISK_SECONDS_TOTAL: &str =
+pub const GRPC_SUBSCRIBE_REPLAY_DISK_CPU_SECONDS_TOTAL: &str =
     "grpc_subscribe_replay_disk_cpu_seconds_total"; // x_subscription_id
 pub const PUBSUB_SLOT: &str = "pubsub_slot"; // commitment
 pub const PUBSUB_CACHED_SIGNATURES_TOTAL: &str = "pubsub_cached_signatures_total";
@@ -71,11 +71,11 @@ pub fn setup() -> Result<PrometheusHandle, BuildError> {
     describe_gauge!(CHANNEL_MESSAGES_TOTAL, "Total number of messages in channel");
     describe_gauge!(CHANNEL_SLOTS_TOTAL, "Total number of slots in channel");
     describe_gauge!(CHANNEL_BYTES_TOTAL, "Total size of all messages in channel");
-    describe_counter!(
+    describe_gauge!(
         CHANNEL_STORAGE_WRITE_SER_INDEX,
         "Storage write serialize index"
     );
-    describe_counter!(CHANNEL_STORAGE_WRITE_INDEX, "Storage write index");
+    describe_gauge!(CHANNEL_STORAGE_WRITE_INDEX, "Storage write index");
     describe_gauge!(
         CHANNEL_STORAGE_SLOTS_TOTAL,
         "Total number of slots in storage"
@@ -87,7 +87,7 @@ pub fn setup() -> Result<PrometheusHandle, BuildError> {
     describe_counter!(GRPC_SUBSCRIBE_MESSAGES_COUNT_TOTAL, "Number of gRPC messages in subscriptions by type");
     describe_counter!(GRPC_SUBSCRIBE_MESSAGES_BYTES_TOTAL, "Total size of gRPC messages in subscriptions by type");
     describe_gauge!(GRPC_SUBSCRIBE_CPU_SECONDS_TOTAL, "CPU consumption of gRPC filters in subscriptions");
-    describe_gauge!(GRPC_SUBSCRIBE_REPLAY_DISK_SECONDS_TOTAL, "CPU consumption of gRPC filters in subscriptions on replay from disk");
+    describe_gauge!(GRPC_SUBSCRIBE_REPLAY_DISK_CPU_SECONDS_TOTAL, "CPU consumption of gRPC filters in subscriptions on replay from disk");
     describe_gauge!(PUBSUB_SLOT, "Latest slot handled in PubSub by commitment");
     describe_gauge!(PUBSUB_CACHED_SIGNATURES_TOTAL, "Number of cached signatures");
     describe_gauge!(PUBSUB_STORED_MESSAGES_COUNT_TOTAL, "Number of stored filtered messages in cache");

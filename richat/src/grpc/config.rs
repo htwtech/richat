@@ -39,6 +39,7 @@ impl Default for ConfigAppsGrpcWorkers {
     fn default() -> Self {
         Self {
             threads: ConfigAppsWorkers::default(),
+            // Max cached filtered messages per worker per commitment level.
             messages_cached_max: 1_024,
             ticks_without_messages_max: None,
         }
@@ -61,8 +62,11 @@ pub struct ConfigAppsGrpcStream {
 impl Default for ConfigAppsGrpcStream {
     fn default() -> Self {
         Self {
+            // 16 MiB — max queued message bytes before backpressure.
             messages_len_max: 16 * 1024 * 1024,
+            // Max messages filtered per worker tick.
             messages_max_per_tick: 100,
+            // 256 MiB — max queued message bytes during disk replay.
             messages_replay_len_max: 256 * 1024 * 1024,
             ping_interval: Duration::from_secs(15),
         }

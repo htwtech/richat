@@ -22,7 +22,13 @@
       "Bash(SSH=\"ssh -p 40102 -i C:/Users/kp6c6/.ssh/bubba.key -o StrictHostKeyChecking=no bubba@138.199.142.171\")",
       "Bash(git checkout:*)",
       "WebFetch(domain:runs.solstack.app)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(for f in client/src/shm.rs plugin-agave/src/channel.rs plugin-agave/src/config.rs plugin-agave/src/plugin.rs plugin-agave/src/protobuf/encoding/mod.rs plugin-agave/src/protobuf/message.rs richat/src/channel.rs richat/src/config.rs richat/src/grpc/config.rs richat/src/grpc/server.rs richat/src/metrics.rs richat/src/pubsub/tracker.rs richat/src/storage.rs shared/src/transports/grpc.rs shared/src/transports/shm.rs)",
+      "Bash(do scp -P 40102 -i ~/.ssh/bubba.key \"$f\" bubba@104.37.188.2:~/richat/\"$f\")",
+      "Bash(done)",
+      "Bash(for f in plugin-agave/src/config.rs plugin-agave/src/plugin.rs richat/src/channel.rs)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:docs.anza.xyz)"
     ]
   }
 }

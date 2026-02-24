@@ -18,10 +18,50 @@ use {
         Deserialize,
         de::{self, Deserializer},
     },
+    solana_pubkey::Pubkey,
     std::{collections::HashSet, path::PathBuf, thread::Builder},
     tokio::time::{Duration, sleep},
     tokio_util::sync::CancellationToken,
 };
+
+/// Pre-filter configuration for SHM V2 metadata-based filtering.
+/// When present, messages that don't match are skipped before reading data from the ring.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigShmPreFilter {
+    /// Skip account messages not matching these pubkeys (empty = accept all)
+    #[serde(default, deserialize_with = "deserialize_pubkey_set")]
+    pub account_pubkeys: HashSet<Pubkey>,
+    /// Skip account messages not matching these owners (empty = accept all)
+    #[serde(default, deserialize_with = "deserialize_pubkey_set")]
+    pub account_owners: HashSet<Pubkey>,
+    /// If true, skip vote transactions
+    #[serde(default)]
+    pub exclude_votes: bool,
+    /// If true, skip failed transactions
+    #[serde(default)]
+    pub exclude_failed: bool,
+    /// If true, skip all account messages
+    #[serde(default)]
+    pub disable_accounts: bool,
+    /// If true, skip all transaction messages
+    #[serde(default)]
+    pub disable_transactions: bool,
+    /// If true, skip all entry messages
+    #[serde(default)]
+    pub disable_entries: bool,
+}
+
+fn deserialize_pubkey_set<'de, D>(deserializer: D) -> Result<HashSet<Pubkey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let strings: Vec<String> = Vec::deserialize(deserializer)?;
+    strings
+        .into_iter()
+        .map(|s| s.parse::<Pubkey>().map_err(de::Error::custom))
+        .collect()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,7 +98,7 @@ impl ConfigChannel {
                 ConfigChannelSource::Shm { general, .. } => general.parser,
             };
         }
-        unreachable!("deserialize should check sources")
+        panic!("sources list is empty — should have been rejected during deserialization")
     }
 
     pub fn ensure_sources_have_reconnect(&self) -> anyhow::Result<()> {
@@ -145,6 +185,8 @@ pub enum ConfigChannelSource {
         general: ConfigChannelSourceGeneral,
         #[serde(flatten)]
         config: ConfigShmClient,
+        #[serde(default)]
+        pre_filter: Option<ConfigShmPreFilter>,
     },
 }
 
@@ -229,8 +271,10 @@ pub struct ConfigChannelInner {
 impl Default for ConfigChannelInner {
     fn default() -> Self {
         Self {
-            max_messages: 2_097_152, // aligned to power of 2, ~20k/slot should give us ~100 slots
-            max_bytes: 15 * 1024 * 1024 * 1024, // 15GiB with ~150MiB/slot should give us ~100 slots
+            // 2M messages (~20k/slot → ~100 slots in buffer). Must be power of 2.
+            max_messages: 2_097_152,
+            // 15 GiB (~150 MiB/slot → ~100 slots in buffer).
+            max_bytes: 15 * 1024 * 1024 * 1024,
             storage: None,
         }
     }
@@ -387,8 +431,9 @@ impl ConfigAppsWorkers {
     ) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>>> {
         let th = Builder::new().name(name).spawn(move || {
             if let Some(cpus) = cpus {
-                affinity_linux::set_thread_affinity(cpus.into_iter())
-                    .expect("failed to set affinity");
+                if let Err(e) = affinity_linux::set_thread_affinity(cpus.into_iter()) {
+                    tracing::warn!("failed to set thread affinity: {e}");
+                }
             }
             spawn_fn(index)
         })?;
@@ -398,7 +443,7 @@ impl ConfigAppsWorkers {
                 let ms = if shutdown.is_cancelled() { 10 } else { 2_000 };
                 sleep(Duration::from_millis(ms)).await;
             }
-            th.join().expect("failed to join thread")
+            th.join().map_err(|_| anyhow::anyhow!("thread panicked"))?
         });
 
         Ok(jh.map_err(anyhow::Error::new).and_then(ready))

@@ -240,6 +240,9 @@ impl GrpcServer {
     #[inline]
     fn push_client(&self, client: SubscribeClient) {
         self.subscribe_clients.push(client);
+        // Hold the lock while notifying to prevent lost wakeups:
+        // without this, notify_one() can fire before the worker enters wait_timeout().
+        let _guard = mutex_lock(&self.client_notify.0);
         self.client_notify.1.notify_one();
     }
 
@@ -308,10 +311,11 @@ impl GrpcServer {
             let Some(client) = self.pop_client(prev_client.take()) else {
                 // No clients — wait on Condvar instead of spinning
                 let (lock, cvar) = &*self.client_notify;
-                let guard = lock.lock().unwrap();
+                let guard = mutex_lock(lock);
                 // Re-check after acquiring lock to avoid race
                 if self.subscribe_clients.is_empty() {
-                    let _ = cvar.wait_timeout(guard, Duration::from_secs(1)).unwrap();
+                    let _ = cvar.wait_timeout(guard, Duration::from_secs(1))
+                        .unwrap_or_else(|e| e.into_inner());
                 }
                 if shutdown.is_cancelled() {
                     while self.pop_client(None).is_some() {}
@@ -508,7 +512,7 @@ impl GrpcServer {
                                         && matches!(state.head, IndexLocation::Storage(_))
                                     {
                                         let metric_cpu_usage = gauge!(
-                                            metrics::GRPC_SUBSCRIBE_REPLAY_DISK_SECONDS_TOTAL,
+                                            metrics::GRPC_SUBSCRIBE_REPLAY_DISK_CPU_SECONDS_TOTAL,
                                             "x_subscription_id" => Arc::clone(&x_subscription_id)
                                         );
                                         messages

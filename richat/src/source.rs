@@ -3,7 +3,7 @@ use {
         channel::GlobalReplayFromSlot,
         config::{
             ConfigChannelSource, ConfigChannelSourceGeneral, ConfigChannelSourceReconnect,
-            ConfigGrpcClientSource,
+            ConfigGrpcClientSource, ConfigShmPreFilter,
         },
     },
     anyhow::Context as _,
@@ -15,7 +15,7 @@ use {
     richat_client::{
         grpc::{ConfigGrpcClient, GrpcClientBuilderError},
         quic::{ConfigQuicClient, QuicConnectError},
-        shm::{ConfigShmClient, ShmConnectError, ShmSubscription},
+        shm::{ConfigShmClient, ShmConnectError, ShmEntryMeta, ShmSubscription},
     },
     richat_filter::message::{Message, MessageParseError, MessageParserEncoding},
     richat_proto::{
@@ -82,6 +82,7 @@ enum SubscriptionConfig {
     },
     Shm {
         config: ConfigShmClient,
+        pre_filter: Option<crate::config::ConfigShmPreFilter>,
     },
 }
 
@@ -94,8 +95,102 @@ impl SubscriptionConfig {
                 source,
                 config,
             } => (Self::Grpc { source, config }, general),
-            ConfigChannelSource::Shm { general, config } => (Self::Shm { config }, general),
+            ConfigChannelSource::Shm {
+                general,
+                config,
+                pre_filter,
+            } => (Self::Shm { config, pre_filter }, general),
         }
+    }
+}
+
+/// Fast pre-filter using V2 SHM index metadata.
+/// Decides whether to skip a message before reading data from the ring buffer.
+struct ShmPreFilter {
+    disable_accounts: bool,
+    disable_transactions: bool,
+    disable_entries: bool,
+    exclude_votes: bool,
+    exclude_failed: bool,
+    account_pubkeys: HashSet<[u8; 32]>,
+    account_owners: HashSet<[u8; 32]>,
+}
+
+impl ShmPreFilter {
+    fn from_config(config: Option<ConfigShmPreFilter>) -> Self {
+        let config = config.unwrap_or_default();
+        Self {
+            disable_accounts: config.disable_accounts,
+            disable_transactions: config.disable_transactions,
+            disable_entries: config.disable_entries,
+            exclude_votes: config.exclude_votes,
+            exclude_failed: config.exclude_failed,
+            account_pubkeys: config
+                .account_pubkeys
+                .iter()
+                .map(|pk| pk.to_bytes())
+                .collect(),
+            account_owners: config
+                .account_owners
+                .iter()
+                .map(|pk| pk.to_bytes())
+                .collect(),
+        }
+    }
+
+    /// Returns true if the message should be accepted (i.e. NOT skipped).
+    fn should_accept(&self, meta: &ShmEntryMeta) -> bool {
+        use richat_shared::transports::shm::{
+            FLAG_TX_FAILED, FLAG_TX_IS_VOTE, MSG_TYPE_ACCOUNT, MSG_TYPE_BLOCK_META,
+            MSG_TYPE_ENTRY, MSG_TYPE_SLOT, MSG_TYPE_TRANSACTION,
+        };
+
+        match meta.msg_type {
+            MSG_TYPE_ACCOUNT => {
+                if self.disable_accounts {
+                    return false;
+                }
+                if !self.account_pubkeys.is_empty() {
+                    let pubkey: &[u8; 32] = meta.meta[0..32].try_into().unwrap();
+                    if !self.account_pubkeys.contains(pubkey) {
+                        return false;
+                    }
+                }
+                if !self.account_owners.is_empty() {
+                    let owner: &[u8; 32] = meta.meta[32..64].try_into().unwrap();
+                    if !self.account_owners.contains(owner) {
+                        return false;
+                    }
+                }
+                true
+            }
+            MSG_TYPE_TRANSACTION => {
+                if self.disable_transactions {
+                    return false;
+                }
+                if self.exclude_votes && (meta.flags & FLAG_TX_IS_VOTE != 0) {
+                    return false;
+                }
+                if self.exclude_failed && (meta.flags & FLAG_TX_FAILED != 0) {
+                    return false;
+                }
+                true
+            }
+            MSG_TYPE_ENTRY => !self.disable_entries,
+            MSG_TYPE_SLOT | MSG_TYPE_BLOCK_META => true,
+            _ => true,
+        }
+    }
+
+    /// Returns true if this filter does nothing (all defaults, no filtering).
+    fn is_noop(&self) -> bool {
+        !self.disable_accounts
+            && !self.disable_transactions
+            && !self.disable_entries
+            && !self.exclude_votes
+            && !self.exclude_failed
+            && self.account_pubkeys.is_empty()
+            && self.account_owners.is_empty()
     }
 }
 
@@ -308,18 +403,27 @@ impl Subscription {
                         .boxed(),
                 }
             }
-            SubscriptionConfig::Shm { config } => {
+            SubscriptionConfig::Shm {
+                config,
+                pre_filter,
+            } => {
                 let sub = ShmSubscription::open(&config).map_err(ConnectError::Shm)?;
-                info!(name, "attached to shared memory");
-                // Parse directly in the SHM reader thread, eliminating one
-                // channel hop and tokio::spawn compared to other transports.
-                let rx = sub.subscribe_map(channel_size, move |data| {
-                    match Message::parse(data.into(), parser) {
-                        Ok(message) => Some(Ok((name, message))),
-                        Err(MessageParseError::InvalidUpdateMessage("Ping")) => None,
-                        Err(error) => Some(Err(error.into())),
-                    }
-                });
+                let pf = ShmPreFilter::from_config(pre_filter);
+                let has_pre_filter = !pf.is_noop();
+                info!(name, has_pre_filter, "attached to shared memory");
+                // Parse directly in the SHM reader thread with V2 metadata pre-filter.
+                // Messages that fail the pre-filter are skipped without reading data.
+                let rx = sub.subscribe_filter_map_v2(
+                    channel_size,
+                    move |meta| pf.should_accept(meta),
+                    move |_meta, data| {
+                        match Message::parse(data.into(), parser) {
+                            Ok(message) => Some(Ok((name, message))),
+                            Err(MessageParseError::InvalidUpdateMessage("Ping")) => None,
+                            Err(error) => Some(Err(error.into())),
+                        }
+                    },
+                );
                 info!(name, "subscribed");
                 return Ok(rx.to_async());
             }

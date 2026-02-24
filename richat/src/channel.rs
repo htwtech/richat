@@ -577,16 +577,21 @@ impl Sender {
                     }
                 }
                 Message::Entry(msg) => {
+                    const MAX_ENTRIES: usize = 1_000_000;
                     let index = msg.index() as usize;
-                    if dedup.entries.len() <= index {
-                        dedup.entries.resize(
-                            index.next_power_of_two().max(dedup.entries.len() * 2),
-                            false,
-                        );
-                    }
-                    if !dedup.entries[index] {
-                        dedup.entries[index] = true;
-                        messages.push(ParsedMessage::Entry(Arc::new(msg)));
+                    if index >= MAX_ENTRIES {
+                        tracing::error!("entry index {index} exceeds MAX_ENTRIES ({MAX_ENTRIES}), dropping");
+                    } else {
+                        if dedup.entries.len() <= index {
+                            dedup.entries.resize(
+                                index.next_power_of_two().max(dedup.entries.len() * 2),
+                                false,
+                            );
+                        }
+                        if !dedup.entries[index] {
+                            dedup.entries[index] = true;
+                            messages.push(ParsedMessage::Entry(Arc::new(msg)));
+                        }
                     }
                 }
                 Message::BlockMeta(msg) => {
@@ -739,12 +744,13 @@ impl Sender {
                     _ => break,
                 }
             }
+            const CLEANUP_SCAN_LIMIT: usize = 300;
             while replay_lock.len() > self.storage_max_slots {
                 if let Some((slot, _replay)) = replay_lock.pop_first() {
                     if let Some(storage) = &self.storage {
                         let until = replay_lock
                             .values()
-                            .take(300)
+                            .take(CLEANUP_SCAN_LIMIT)
                             .map(|replay| replay.head)
                             .min();
 
@@ -813,7 +819,8 @@ impl SenderShared {
             let idx = self.shared.get_idx(self.head);
             let mut item = self.shared.buffer_idx(idx);
             let Some(message) = item.data.take() else {
-                panic!("nothing to remove to keep bytes under limit")
+                tracing::error!("bytes accounting inconsistency: item.data is None; breaking eviction loop");
+                break;
             };
 
             self.head = self.head.wrapping_add(1);
@@ -957,8 +964,9 @@ impl ReceiverSync {
     /// Block until new messages may be available, or timeout.
     pub fn wait_for_messages(&self, timeout: Duration) {
         if let Some((lock, cvar)) = &self.shared_processed.sync_notify {
-            let guard = lock.lock().unwrap();
-            let _ = cvar.wait_timeout(guard, timeout).unwrap();
+            let guard = mutex_lock(lock);
+            let _ = cvar.wait_timeout(guard, timeout)
+                .unwrap_or_else(|e| e.into_inner());
         } else {
             std::thread::sleep(timeout);
         }

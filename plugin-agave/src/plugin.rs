@@ -9,12 +9,22 @@ use {
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
         ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
-        SlotStatus,
+        SlotStatus as GeyserSlotStatus,
     },
     futures::future::BoxFuture,
     log::error,
     richat_metrics::{MaybeRecorder, gauge},
-    richat_shared::transports::{grpc::GrpcServer, quic::QuicServer, shm::ShmDirectWriter},
+    richat_shared::transports::{
+        grpc::GrpcServer,
+        quic::QuicServer,
+        shm::{
+            ShmDirectWriter, ShmWriteMeta,
+            FLAG_ACC_EXECUTABLE, FLAG_ACC_HAS_TXN_SIG,
+            FLAG_TX_FAILED, FLAG_TX_IS_VOTE,
+            MSG_TYPE_ACCOUNT, MSG_TYPE_BLOCK_META, MSG_TYPE_ENTRY, MSG_TYPE_SLOT,
+            MSG_TYPE_TRANSACTION,
+        },
+    },
     solana_clock::Slot,
     std::{cell::RefCell, fmt, sync::Arc, time::Duration},
     tokio::{runtime::Runtime, task::JoinError},
@@ -53,6 +63,8 @@ impl fmt::Debug for PluginTask {
 }
 
 thread_local! {
+    // 64 KiB initial capacity; grows as needed. After warmup, the buffer
+    // stabilizes at the size of the largest message seen, avoiding further allocations.
     static ENCODE_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(64 * 1024));
 }
 
@@ -63,36 +75,107 @@ pub struct PluginInner {
     shm_direct: Option<Arc<ShmDirectWriter>>,
     encoder: ProtobufEncoder,
     shutdown: CancellationToken,
+    shutdown_timeout_secs: u64,
     tasks: Vec<(&'static str, PluginTask)>,
 }
 
 impl PluginInner {
     fn dispatch(&self, message: ProtobufMessage) {
         match (&self.shm_direct, &self.messages) {
-            // SHM-only: encode into thread-local buffer, write directly
+            // SHM-only: encode into thread-local buffer, write directly with V2 metadata
             (Some(shm), None) => {
                 let slot = message.get_slot();
+                let write_meta = Self::extract_shm_meta(&message);
                 ENCODE_BUF.with(|buf| {
                     let mut buf = buf.borrow_mut();
                     message.encode_into(self.encoder, &mut buf);
-                    shm.write(&buf, slot);
+                    shm.write(&buf, slot, &write_meta);
                 });
             }
             // Channel-only (no SHM): existing path
             (None, Some(sender)) => {
                 sender.push(message, self.encoder);
             }
-            // Combined: encode once, write to SHM, push pre-encoded to channel
+            // Combined: encode once, write to SHM with V2 metadata, push pre-encoded to channel
             (Some(shm), Some(sender)) => {
                 let slot = message.get_slot();
+                let write_meta = Self::extract_shm_meta(&message);
                 ENCODE_BUF.with(|buf| {
                     let mut buf = buf.borrow_mut();
                     message.encode_into(self.encoder, &mut buf);
-                    shm.write(&buf, slot);
+                    shm.write(&buf, slot, &write_meta);
                     sender.push_pre_encoded(message, buf.to_vec(), self.encoder);
                 });
             }
             (None, None) => {}
+        }
+    }
+
+    /// Extract metadata from a ProtobufMessage for the V2 SHM index entry.
+    fn extract_shm_meta(message: &ProtobufMessage) -> ShmWriteMeta {
+        let mut wm = ShmWriteMeta::default();
+        match message {
+            ProtobufMessage::Account { account, .. } => {
+                wm.msg_type = MSG_TYPE_ACCOUNT;
+                if account.executable {
+                    wm.flags |= FLAG_ACC_EXECUTABLE;
+                }
+                if account.txn.is_some() {
+                    wm.flags |= FLAG_ACC_HAS_TXN_SIG;
+                }
+                // pubkey → meta[0..32]
+                let pk_len = account.pubkey.len().min(32);
+                wm.meta[..pk_len].copy_from_slice(&account.pubkey[..pk_len]);
+                // owner → meta[32..64]
+                let ow_len = account.owner.len().min(32);
+                wm.meta[32..32 + ow_len].copy_from_slice(&account.owner[..ow_len]);
+                // lamports → meta[64..72]
+                wm.meta[64..72].copy_from_slice(&account.lamports.to_le_bytes());
+            }
+            ProtobufMessage::Transaction { transaction, .. } => {
+                wm.msg_type = MSG_TYPE_TRANSACTION;
+                if transaction.is_vote {
+                    wm.flags |= FLAG_TX_IS_VOTE;
+                }
+                if transaction.transaction_status_meta.status.is_err() {
+                    wm.flags |= FLAG_TX_FAILED;
+                }
+                // signature → meta[0..64]
+                let sig = transaction.signature.as_ref();
+                let sig_len = sig.len().min(64);
+                wm.meta[..sig_len].copy_from_slice(&sig[..sig_len]);
+            }
+            ProtobufMessage::Slot {
+                status, parent, ..
+            } => {
+                wm.msg_type = MSG_TYPE_SLOT;
+                wm.flags = Self::slot_status_to_u8(status);
+                if let Some(p) = parent {
+                    wm.meta[0..8].copy_from_slice(&p.to_le_bytes());
+                }
+            }
+            ProtobufMessage::Entry { entry } => {
+                wm.msg_type = MSG_TYPE_ENTRY;
+                wm.meta[0..8].copy_from_slice(&(entry.index as u64).to_le_bytes());
+                wm.meta[8..16]
+                    .copy_from_slice(&entry.executed_transaction_count.to_le_bytes());
+            }
+            ProtobufMessage::BlockMeta { .. } => {
+                wm.msg_type = MSG_TYPE_BLOCK_META;
+            }
+        }
+        wm
+    }
+
+    fn slot_status_to_u8(status: &GeyserSlotStatus) -> u8 {
+        match status {
+            GeyserSlotStatus::Processed => 0,
+            GeyserSlotStatus::Confirmed => 1,
+            GeyserSlotStatus::Rooted => 2,
+            GeyserSlotStatus::FirstShredReceived => 3,
+            GeyserSlotStatus::Completed => 4,
+            GeyserSlotStatus::CreatedBank => 5,
+            GeyserSlotStatus::Dead(_) => 6,
         }
     }
 
@@ -139,7 +222,8 @@ impl PluginInner {
 
                 // Start gRPC
                 if let Some(config) = config.grpc {
-                    let sender = messages.as_ref().expect("channel created for grpc");
+                    let sender = messages.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("channel required for gRPC but was not created"))?;
                     let connections_inc = gauge!(&metrics_recorder, metrics::CONNECTIONS_TOTAL, "transport" => "grpc");
                     let connections_dec = connections_inc.clone();
                     tasks.push((
@@ -160,7 +244,8 @@ impl PluginInner {
 
                 // Start Quic
                 if let Some(config) = config.quic {
-                    let sender = messages.as_ref().expect("channel created for quic");
+                    let sender = messages.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("channel required for QUIC but was not created"))?;
                     let connections_inc = gauge!(&metrics_recorder, metrics::CONNECTIONS_TOTAL, "transport" => "quic");
                     let connections_dec = connections_inc.clone();
                     tasks.push((
@@ -203,6 +288,7 @@ impl PluginInner {
             shm_direct,
             encoder: config.channel.encoder,
             shutdown,
+            shutdown_timeout_secs: config.shutdown_timeout_secs,
             tasks,
         })
     }
@@ -211,6 +297,14 @@ impl PluginInner {
 #[derive(Debug, Default)]
 pub struct Plugin {
     inner: Option<PluginInner>,
+}
+
+impl Plugin {
+    fn get_inner(&self) -> PluginResult<&PluginInner> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| GeyserPluginError::Custom("plugin not initialized".into()))
+    }
 }
 
 impl GeyserPlugin for Plugin {
@@ -257,7 +351,7 @@ impl GeyserPlugin for Plugin {
                 shm.remove_file();
             }
 
-            inner.runtime.shutdown_timeout(Duration::from_secs(10));
+            inner.runtime.shutdown_timeout(Duration::from_secs(inner.shutdown_timeout_secs));
         }
     }
 
@@ -270,15 +364,19 @@ impl GeyserPlugin for Plugin {
         if !is_startup {
             let account = match account {
                 ReplicaAccountInfoVersions::V0_0_1(_info) => {
-                    unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
+                    return Err(GeyserPluginError::Custom(
+                        "ReplicaAccountInfoVersions::V0_0_1 is not supported".into(),
+                    ));
                 }
                 ReplicaAccountInfoVersions::V0_0_2(_info) => {
-                    unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
+                    return Err(GeyserPluginError::Custom(
+                        "ReplicaAccountInfoVersions::V0_0_2 is not supported".into(),
+                    ));
                 }
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
 
-            let inner = self.inner.as_ref().expect("initialized");
+            let inner = self.get_inner()?;
             inner.dispatch(ProtobufMessage::Account { slot, account });
         }
 
@@ -293,9 +391,9 @@ impl GeyserPlugin for Plugin {
         &self,
         slot: Slot,
         parent: Option<u64>,
-        status: &SlotStatus,
+        status: &GeyserSlotStatus,
     ) -> PluginResult<()> {
-        let inner = self.inner.as_ref().expect("initialized");
+        let inner = self.get_inner()?;
         inner.dispatch(ProtobufMessage::Slot {
             slot,
             parent,
@@ -312,15 +410,19 @@ impl GeyserPlugin for Plugin {
     ) -> PluginResult<()> {
         let transaction = match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(_info) => {
-                unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
+                return Err(GeyserPluginError::Custom(
+                    "ReplicaTransactionInfoVersions::V0_0_1 is not supported".into(),
+                ));
             }
             ReplicaTransactionInfoVersions::V0_0_2(_info) => {
-                unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
+                return Err(GeyserPluginError::Custom(
+                    "ReplicaTransactionInfoVersions::V0_0_2 is not supported".into(),
+                ));
             }
             ReplicaTransactionInfoVersions::V0_0_3(info) => info,
         };
 
-        let inner = self.inner.as_ref().expect("initialized");
+        let inner = self.get_inner()?;
         inner.dispatch(ProtobufMessage::Transaction { slot, transaction });
 
         Ok(())
@@ -330,12 +432,14 @@ impl GeyserPlugin for Plugin {
         #[allow(clippy::infallible_destructuring_match)]
         let entry = match entry {
             ReplicaEntryInfoVersions::V0_0_1(_entry) => {
-                unreachable!("ReplicaEntryInfoVersions::V0_0_1 is not supported")
+                return Err(GeyserPluginError::Custom(
+                    "ReplicaEntryInfoVersions::V0_0_1 is not supported".into(),
+                ));
             }
             ReplicaEntryInfoVersions::V0_0_2(entry) => entry,
         };
 
-        let inner = self.inner.as_ref().expect("initialized");
+        let inner = self.get_inner()?;
         inner.dispatch(ProtobufMessage::Entry { entry });
 
         Ok(())
@@ -344,18 +448,24 @@ impl GeyserPlugin for Plugin {
     fn notify_block_metadata(&self, blockinfo: ReplicaBlockInfoVersions<'_>) -> PluginResult<()> {
         let blockinfo = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(_info) => {
-                unreachable!("ReplicaBlockInfoVersions::V0_0_1 is not supported")
+                return Err(GeyserPluginError::Custom(
+                    "ReplicaBlockInfoVersions::V0_0_1 is not supported".into(),
+                ));
             }
             ReplicaBlockInfoVersions::V0_0_2(_info) => {
-                unreachable!("ReplicaBlockInfoVersions::V0_0_2 is not supported")
+                return Err(GeyserPluginError::Custom(
+                    "ReplicaBlockInfoVersions::V0_0_2 is not supported".into(),
+                ));
             }
             ReplicaBlockInfoVersions::V0_0_3(_info) => {
-                unreachable!("ReplicaBlockInfoVersions::V0_0_3 is not supported")
+                return Err(GeyserPluginError::Custom(
+                    "ReplicaBlockInfoVersions::V0_0_3 is not supported".into(),
+                ));
             }
             ReplicaBlockInfoVersions::V0_0_4(info) => info,
         };
 
-        let inner = self.inner.as_ref().expect("initialized");
+        let inner = self.get_inner()?;
         inner.dispatch(ProtobufMessage::BlockMeta { blockinfo });
 
         Ok(())

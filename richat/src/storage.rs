@@ -8,7 +8,7 @@ use {
         },
         util::SpawnedThreads,
     },
-    ::metrics::{Gauge, counter},
+    ::metrics::{Gauge, gauge},
     anyhow::Context,
     hyper::body::Buf,
     prost::{
@@ -165,8 +165,9 @@ impl Storage {
                 let db = Arc::clone(&db);
                 || {
                     if let Some(cpus) = config.serialize_affinity {
-                        affinity_linux::set_thread_affinity(cpus.into_iter())
-                            .expect("failed to set affinity");
+                        if let Err(e) = affinity_linux::set_thread_affinity(cpus.into_iter()) {
+                            tracing::warn!("failed to set storage serialize thread affinity: {e}");
+                        }
                     }
                     Self::spawn_ser(db, ser_rx, write_tx);
                     Ok(())
@@ -179,8 +180,9 @@ impl Storage {
                 let db = Arc::clone(&db);
                 || {
                     if let Some(cpus) = config.write_affinity {
-                        affinity_linux::set_thread_affinity(cpus.into_iter())
-                            .expect("failed to set affinity");
+                        if let Err(e) = affinity_linux::set_thread_affinity(cpus.into_iter()) {
+                            tracing::warn!("failed to set storage write thread affinity: {e}");
+                        }
                     }
                     Self::spawn_write(db, write_rx)
                 }
@@ -195,8 +197,9 @@ impl Storage {
                 let shutdown = shutdown.clone();
                 move || {
                     if let Some(cpus) = affinity {
-                        affinity_linux::set_thread_affinity(cpus.into_iter())
-                            .expect("failed to set affinity");
+                        if let Err(e) = affinity_linux::set_thread_affinity(cpus.into_iter()) {
+                            tracing::warn!("failed to set storage replay thread affinity: {e}");
+                        }
                     }
                     Self::spawn_replay(
                         db,
@@ -261,7 +264,7 @@ impl Storage {
 
     fn cf_handle<C: ColumnName>(db: &DB) -> &ColumnFamily {
         db.cf_handle(C::NAME)
-            .expect("should never get an unknown column")
+            .unwrap_or_else(|| panic!("column family '{}' not found — possible DB corruption or version mismatch", C::NAME))
     }
 
     fn spawn_ser(
@@ -320,7 +323,7 @@ impl Storage {
                         &buf,
                     );
 
-                    counter!(CHANNEL_STORAGE_WRITE_SER_INDEX).absolute(index);
+                    gauge!(CHANNEL_STORAGE_WRITE_SER_INDEX).set(index as f64);
                     gindex = index;
                 }
                 WriteRequest::RemoveReplay { slot, until } => {
@@ -351,7 +354,7 @@ impl Storage {
     fn spawn_write(db: Arc<DB>, rx: kanal::Receiver<(u64, WriteBatch)>) -> anyhow::Result<()> {
         while let Ok((index, batch)) = rx.recv() {
             db.write(batch)?;
-            counter!(CHANNEL_STORAGE_WRITE_INDEX).absolute(index);
+            gauge!(CHANNEL_STORAGE_WRITE_INDEX).set(index as f64);
         }
         Ok(())
     }

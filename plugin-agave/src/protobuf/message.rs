@@ -280,7 +280,12 @@ impl ProtobufMessage<'_> {
         };
         buf.clear();
         buf.reserve(update.encoded_len());
-        update.encode(buf).expect("sufficient capacity");
+        if let Err(e) = update.encode(buf) {
+            // reserve() above should guarantee sufficient capacity;
+            // fall back to encode_to_vec() if it somehow fails.
+            log::error!("prost encode failed ({e}), falling back to encode_to_vec");
+            *buf = update.encode_to_vec();
+        }
     }
 
     pub fn encode_raw_into(&self, created_at: impl Into<Timestamp>, buf: &mut Vec<u8>) {
@@ -346,66 +351,8 @@ impl ProtobufMessage<'_> {
     }
 
     pub fn encode_raw(&self, created_at: impl Into<Timestamp>) -> Vec<u8> {
-        let created_at = created_at.into();
-
-        let size = match self {
-            Self::Account { slot, account } => {
-                let account = encoding::Account::new(*slot, account);
-                message::encoded_len(2, &account)
-            }
-            Self::Slot {
-                slot,
-                parent,
-                status,
-            } => {
-                let slot = encoding::Slot::new(*slot, *parent, status);
-                message::encoded_len(3, &slot)
-            }
-            Self::Transaction { slot, transaction } => {
-                let transaction = encoding::Transaction::new(*slot, transaction);
-                message::encoded_len(4, &transaction)
-            }
-            Self::BlockMeta { blockinfo } => {
-                let blockmeta = encoding::BlockMeta::new(blockinfo);
-                message::encoded_len(7, &blockmeta)
-            }
-            Self::Entry { entry } => {
-                let entry = encoding::Entry::new(entry);
-                message::encoded_len(8, &entry)
-            }
-        } + message::encoded_len(11, &created_at);
-
-        let mut vec = Vec::with_capacity(size);
-        let buffer = &mut vec;
-
-        match self {
-            Self::Account { slot, account } => {
-                let account = encoding::Account::new(*slot, account);
-                message::encode(2, &account, buffer)
-            }
-            Self::Slot {
-                slot,
-                parent,
-                status,
-            } => {
-                let slot = encoding::Slot::new(*slot, *parent, status);
-                message::encode(3, &slot, buffer)
-            }
-            Self::Transaction { slot, transaction } => {
-                let transaction = encoding::Transaction::new(*slot, transaction);
-                message::encode(4, &transaction, buffer)
-            }
-            Self::BlockMeta { blockinfo } => {
-                let blockmeta = encoding::BlockMeta::new(blockinfo);
-                message::encode(7, &blockmeta, buffer)
-            }
-            Self::Entry { entry } => {
-                let entry = encoding::Entry::new(entry);
-                message::encode(8, &entry, buffer)
-            }
-        }
-        message::encode(11, &created_at, buffer);
-
+        let mut vec = Vec::new();
+        self.encode_raw_into(created_at, &mut vec);
         vec
     }
 }

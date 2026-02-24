@@ -49,12 +49,14 @@ const fn u8_to_static_str(num: u8) -> &'static str {
 #[derive(Debug)]
 struct RewardWrapper<'a>(Reward, PhantomData<&'a ()>);
 
+const _: () = {
+    assert!(size_of::<RewardWrapper>() == size_of::<Reward>());
+    assert!(align_of::<RewardWrapper>() == align_of::<Reward>());
+};
+
 impl RewardWrapper<'_> {
     const fn new(rewards: &[Reward]) -> &[Self] {
-        // SAFETY: the compiler guarantees that
-        // `align_of::<RewardWrapper>() == align_of::<Reward>()`,
-        // `size_of::<RewardWrapper>() == size_of::<Reward>()`,
-        // the alignment of `RewardWrapper` and `Reward` are identical.
+        // SAFETY: compile-time asserts above guarantee identical size and alignment.
         unsafe { std::mem::transmute(rewards) }
     }
 }

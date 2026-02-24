@@ -186,7 +186,8 @@ impl Sender {
             let idx = self.shared.get_idx(state.head);
             let mut item = self.shared.buffer_idx(idx);
             let Some(message) = item.data.take() else {
-                panic!("nothing to remove to keep bytes under limit")
+                error!("bytes accounting inconsistency: item.data is None; breaking eviction loop");
+                break;
             };
 
             state.head = state.head.wrapping_add(1);

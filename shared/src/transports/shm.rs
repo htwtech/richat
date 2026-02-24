@@ -47,8 +47,27 @@ impl From<ConfigShmFilter> for RichatFilter {
 
 pub const MAGIC: u64 = 0x52494348_41545348; // "RICHATSH"
 pub const VERSION: u64 = 1;
+pub const VERSION_V2: u64 = 2;
 pub const HEADER_SIZE: usize = 64;
 pub const INDEX_ENTRY_SIZE: usize = 32;
+pub const INDEX_ENTRY_SIZE_V2: usize = 128;
+
+// --- Message types ---
+
+pub const MSG_TYPE_SLOT: u8 = 0;
+pub const MSG_TYPE_ACCOUNT: u8 = 1;
+pub const MSG_TYPE_TRANSACTION: u8 = 2;
+pub const MSG_TYPE_ENTRY: u8 = 3;
+pub const MSG_TYPE_BLOCK_META: u8 = 4;
+
+// --- Flags ---
+// Transaction: bit0=is_vote, bit1=failed
+pub const FLAG_TX_IS_VOTE: u8 = 0x01;
+pub const FLAG_TX_FAILED: u8 = 0x02;
+// Account: bit0=executable, bit1=nonempty_txn_sig, bit2=is_startup
+pub const FLAG_ACC_EXECUTABLE: u8 = 0x01;
+pub const FLAG_ACC_HAS_TXN_SIG: u8 = 0x02;
+pub const FLAG_ACC_IS_STARTUP: u8 = 0x04;
 
 // --- Header ---
 
@@ -62,7 +81,7 @@ pub struct ShmHeader {
     pub tail: AtomicU64,
     pub data_tail: AtomicU64,
     pub closed: AtomicU64,
-    pub _reserved: u64,
+    pub index_entry_size: u64,
 }
 
 impl ShmHeader {
@@ -124,6 +143,120 @@ impl ShmIndexEntry {
 }
 
 const _: () = assert!(size_of::<ShmIndexEntry>() == INDEX_ENTRY_SIZE);
+
+// --- Index Entry V2 (128 bytes) ---
+
+/// V2 index ring entry with inline metadata for zero-parse filtering.
+#[repr(C)]
+pub struct ShmIndexEntryV2 {
+    // --- Base (32B, same layout as V1) ---
+    /// Commit flag: -1 = empty, >=0 = committed position
+    pub seq: AtomicI64,
+    /// Byte offset in data ring (monotonic, use % data_capacity)
+    pub data_off: u64,
+    /// Length of the message in bytes
+    pub data_len: u32,
+    /// Message type (MSG_TYPE_*)
+    pub msg_type: u8,
+    /// Bit flags (interpretation depends on msg_type)
+    pub flags: u8,
+    pub _pad0: u16,
+    /// Solana slot number
+    pub slot: u64,
+
+    // --- Type-specific metadata (96B) ---
+    // Account: pubkey[32] + owner[32] + lamports[8] + pad[24]
+    // Transaction: signature[64] + pad[32]
+    // Slot: parent[8] + pad[88]
+    // Entry: index[8] + executed_tx_count[8] + pad[80]
+    // BlockMeta: pad[96]
+    pub meta: [u8; 96],
+}
+
+impl ShmIndexEntryV2 {
+    /// # Safety
+    ///
+    /// `ptr` must point to at least `INDEX_ENTRY_SIZE_V2` bytes of valid memory,
+    /// properly aligned for `ShmIndexEntryV2`, and remain valid for the lifetime `'a`.
+    #[inline]
+    pub const unsafe fn from_ptr<'a>(ptr: *const u8) -> &'a ShmIndexEntryV2 {
+        unsafe { &*(ptr as *const ShmIndexEntryV2) }
+    }
+
+    /// # Safety
+    ///
+    /// `ptr` must point to at least `INDEX_ENTRY_SIZE_V2` bytes of writable memory,
+    /// properly aligned for `ShmIndexEntryV2`, and remain valid for the lifetime `'a`.
+    #[inline]
+    pub unsafe fn from_ptr_mut<'a>(ptr: *mut u8) -> &'a mut ShmIndexEntryV2 {
+        unsafe { &mut *(ptr as *mut ShmIndexEntryV2) }
+    }
+
+    /// Account pubkey (first 32 bytes of meta). Only valid when msg_type == MSG_TYPE_ACCOUNT.
+    #[inline]
+    pub fn account_pubkey(&self) -> &[u8; 32] {
+        self.meta[0..32].try_into().unwrap()
+    }
+
+    /// Account owner (bytes 32..64 of meta). Only valid when msg_type == MSG_TYPE_ACCOUNT.
+    #[inline]
+    pub fn account_owner(&self) -> &[u8; 32] {
+        self.meta[32..64].try_into().unwrap()
+    }
+
+    /// Account lamports (bytes 64..72 of meta). Only valid when msg_type == MSG_TYPE_ACCOUNT.
+    #[inline]
+    pub fn account_lamports(&self) -> u64 {
+        u64::from_le_bytes(self.meta[64..72].try_into().unwrap())
+    }
+
+    /// Transaction signature (first 64 bytes of meta). Only valid when msg_type == MSG_TYPE_TRANSACTION.
+    #[inline]
+    pub fn tx_signature(&self) -> &[u8; 64] {
+        self.meta[0..64].try_into().unwrap()
+    }
+
+    /// Slot parent (first 8 bytes of meta). Only valid when msg_type == MSG_TYPE_SLOT.
+    #[inline]
+    pub fn slot_parent(&self) -> u64 {
+        u64::from_le_bytes(self.meta[0..8].try_into().unwrap())
+    }
+
+    /// Entry index (first 8 bytes of meta). Only valid when msg_type == MSG_TYPE_ENTRY.
+    #[inline]
+    pub fn entry_index(&self) -> u64 {
+        u64::from_le_bytes(self.meta[0..8].try_into().unwrap())
+    }
+
+    /// Entry executed_transaction_count (bytes 8..16 of meta). Only valid when msg_type == MSG_TYPE_ENTRY.
+    #[inline]
+    pub fn entry_exec_tx_count(&self) -> u64 {
+        u64::from_le_bytes(self.meta[8..16].try_into().unwrap())
+    }
+}
+
+const _: () = assert!(size_of::<ShmIndexEntryV2>() == INDEX_ENTRY_SIZE_V2);
+
+// --- ShmWriteMeta ---
+
+/// Metadata to be written into a V2 index entry alongside the data.
+pub struct ShmWriteMeta {
+    pub msg_type: u8,
+    pub flags: u8,
+    pub slot: u64,
+    pub meta: [u8; 96],
+}
+
+impl Default for ShmWriteMeta {
+    fn default() -> Self {
+        Self {
+            msg_type: 0,
+            flags: 0,
+            slot: 0,
+            meta: [0u8; 96],
+        }
+    }
+}
 
 // --- Ring copy helpers ---
 
@@ -189,6 +322,12 @@ pub struct ConfigShmServer {
     pub max_bytes: usize,
     #[serde(default)]
     pub filter: Option<ConfigShmFilter>,
+    /// Channel capacity for ShmServer async-to-blocking bridge
+    #[serde(
+        default = "ConfigShmServer::default_channel_capacity",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub channel_capacity: usize,
 }
 
 impl ConfigShmServer {
@@ -203,6 +342,10 @@ impl ConfigShmServer {
     const fn default_max_bytes() -> usize {
         15 * 1024 * 1024 * 1024 // 15 GiB
     }
+
+    const fn default_channel_capacity() -> usize {
+        4096
+    }
 }
 
 // --- Writer ---
@@ -212,13 +355,26 @@ const fn next_power_of_two(n: usize) -> usize {
 }
 
 /// Create the SHM file, mmap it, and initialize the header + index entries.
-/// Returns `(mmap, file, idx_capacity, data_capacity)`.
+/// Returns `(mmap, file, idx_capacity, data_capacity, version, entry_size)`.
 fn init_shm_mmap(
     config: &ConfigShmServer,
+    version: u64,
 ) -> Result<(MmapMut, File, usize, usize), ShmError> {
     let idx_capacity = next_power_of_two(config.max_messages);
     let data_capacity = next_power_of_two(config.max_bytes);
-    let total_size = HEADER_SIZE + idx_capacity * INDEX_ENTRY_SIZE + data_capacity;
+    let entry_size = if version >= VERSION_V2 {
+        INDEX_ENTRY_SIZE_V2
+    } else {
+        INDEX_ENTRY_SIZE
+    };
+    let total_size = HEADER_SIZE
+        .checked_add(
+            idx_capacity
+                .checked_mul(entry_size)
+                .expect("SHM index region size overflow"),
+        )
+        .and_then(|v| v.checked_add(data_capacity))
+        .expect("SHM total size overflow");
 
     let file = OpenOptions::new()
         .read(true)
@@ -239,26 +395,25 @@ fn init_shm_mmap(
     unsafe {
         let header = ShmHeader::from_ptr_mut(ptr);
         header.magic = MAGIC;
-        header.version = VERSION;
+        header.version = version;
         header.idx_capacity = idx_capacity as u64;
         header.data_capacity = data_capacity as u64;
         header.tail = AtomicU64::new(0);
         header.data_tail = AtomicU64::new(0);
         header.closed = AtomicU64::new(0);
-        header._reserved = 0;
+        header.index_entry_size = entry_size as u64;
     }
 
     // Initialize index entries: all seq = -1
     for i in 0..idx_capacity {
         // SAFETY: index region is within mmap bounds
         unsafe {
-            let entry_ptr = ptr.add(HEADER_SIZE + i * INDEX_ENTRY_SIZE);
-            let entry = ShmIndexEntry::from_ptr_mut(entry_ptr);
-            entry.seq = AtomicI64::new(-1);
-            entry.data_off = 0;
-            entry.data_len = 0;
-            entry._reserved = 0;
-            entry.slot = 0;
+            let entry_ptr = ptr.add(HEADER_SIZE + i * entry_size);
+            // Zero out the entire entry first (handles V2 meta region too)
+            std::ptr::write_bytes(entry_ptr, 0, entry_size);
+            // Set seq = -1 at the start of each entry (same offset for V1 and V2)
+            let seq_ptr = entry_ptr as *mut AtomicI64;
+            (*seq_ptr) = AtomicI64::new(-1);
         }
     }
 
@@ -274,6 +429,7 @@ struct ShmDirectWriterInner {
     idx_capacity: usize,
     data_capacity: usize,
     idx_mask: u64,
+    entry_size: usize,
     closed: bool,
 }
 
@@ -294,13 +450,15 @@ impl std::fmt::Debug for ShmDirectWriter {
 }
 
 impl ShmDirectWriter {
-    /// Create and initialize the SHM file.
+    /// Create and initialize the SHM file using V2 format.
     pub fn new(config: &ConfigShmServer) -> Result<Self, ShmError> {
-        let (mmap, file, idx_capacity, data_capacity) = init_shm_mmap(config)?;
+        let version = VERSION_V2;
+        let (mmap, file, idx_capacity, data_capacity) = init_shm_mmap(config, version)?;
         let idx_mask = (idx_capacity - 1) as u64;
+        let entry_size = INDEX_ENTRY_SIZE_V2;
         let path = config.path.clone();
 
-        info!(path = %path.display(), idx_capacity, data_capacity, "shm direct writer started");
+        info!(path = %path.display(), idx_capacity, data_capacity, version, entry_size, "shm direct writer started (V2)");
 
         Ok(Self {
             inner: Mutex::new(ShmDirectWriterInner {
@@ -310,6 +468,7 @@ impl ShmDirectWriter {
                 idx_capacity,
                 data_capacity,
                 idx_mask,
+                entry_size,
                 closed: false,
             }),
             path,
@@ -317,18 +476,48 @@ impl ShmDirectWriter {
         })
     }
 
-    /// Write bytes into the ring buffer. `slot` is the Solana slot for the index entry.
+    /// Acquire the lock, returning None if poisoned (marks closed).
     #[inline]
-    pub fn write(&self, data: &[u8], slot: u64) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.closed {
-            return;
+    fn lock_inner(&self) -> Option<std::sync::MutexGuard<'_, ShmDirectWriterInner>> {
+        match self.inner.lock() {
+            Ok(guard) => {
+                if guard.closed {
+                    None
+                } else {
+                    Some(guard)
+                }
+            }
+            Err(poisoned) => {
+                let mut inner = poisoned.into_inner();
+                if !inner.closed {
+                    error!("ShmDirectWriter mutex poisoned; closing to prevent corruption");
+                    inner.closed = true;
+                    let header = unsafe { ShmHeader::from_ptr(inner.mmap.as_mut_ptr()) };
+                    header.closed.store(1, Ordering::Release);
+                }
+                None
+            }
         }
+    }
+
+    /// Write bytes into the ring buffer with V2 metadata.
+    #[inline]
+    pub fn write(&self, data: &[u8], slot: u64, write_meta: &ShmWriteMeta) {
+        let Some(mut inner) = self.lock_inner() else {
+            return;
+        };
 
         let ptr = inner.mmap.as_mut_ptr();
         let data_len = data.len();
         let idx = (inner.pos & inner.idx_mask) as usize;
-        let data_base_offset = HEADER_SIZE + inner.idx_capacity * INDEX_ENTRY_SIZE;
+        let entry_size = inner.entry_size;
+        let data_base_offset = HEADER_SIZE + inner.idx_capacity * entry_size;
+
+        // Check data length fits in u32 (index entry field)
+        if data_len > u32::MAX as usize {
+            error!("SHM message too large ({data_len} bytes), dropping");
+            return;
+        }
 
         // 1. Write data bytes into data ring with wrap-around
         let data_ring_offset = (inner.data_pos % inner.data_capacity as u64) as usize;
@@ -338,16 +527,20 @@ impl ShmDirectWriter {
         };
         copy_to_ring(data_ring, data_ring_offset, data);
 
-        // 2. Write index entry metadata
+        // 2. Write V2 index entry metadata
         // SAFETY: index region is within bounds
         let entry = unsafe {
-            ShmIndexEntry::from_ptr_mut(
-                ptr.add(HEADER_SIZE + idx * INDEX_ENTRY_SIZE),
+            ShmIndexEntryV2::from_ptr_mut(
+                ptr.add(HEADER_SIZE + idx * entry_size),
             )
         };
         entry.data_off = inner.data_pos;
         entry.data_len = data_len as u32;
+        entry.msg_type = write_meta.msg_type;
+        entry.flags = write_meta.flags;
+        entry._pad0 = 0;
         entry.slot = slot;
+        entry.meta.copy_from_slice(&write_meta.meta);
 
         // 3. Advance data position
         inner.data_pos += data_len as u64;
@@ -402,7 +595,7 @@ impl ShmServer {
         messages: impl Subscribe + Send + 'static,
         shutdown: CancellationToken,
     ) -> Result<impl Future<Output = Result<(), JoinError>>, ShmError> {
-        let (mmap, file, idx_capacity, data_capacity) = init_shm_mmap(&config)?;
+        let (mmap, file, idx_capacity, data_capacity) = init_shm_mmap(&config, VERSION)?;
         let idx_mask = (idx_capacity - 1) as u64;
 
         let filter = config.filter.map(RichatFilter::from);
@@ -411,7 +604,7 @@ impl ShmServer {
         info!(path = %path.display(), idx_capacity, data_capacity, "shm server started");
 
         // Use a channel to bridge async stream -> blocking writer thread
-        let (tx, rx) = kanal::bounded(4096);
+        let (tx, rx) = kanal::bounded(config.channel_capacity);
 
         // Async task: subscribes to the ring buffer and forwards messages to channel.
         // Uses a resubscribe loop to handle stale initial position (the ring buffer
@@ -833,5 +1026,160 @@ mod tests {
         let seq = entry.seq.load(Ordering::Acquire);
         assert_ne!(seq, reader_pos as i64, "should detect lag: seq was overwritten");
         assert_eq!(seq, 2);
+    }
+
+    #[test]
+    fn test_index_entry_v2_size() {
+        assert_eq!(size_of::<ShmIndexEntryV2>(), INDEX_ENTRY_SIZE_V2);
+        assert_eq!(INDEX_ENTRY_SIZE_V2, 128);
+    }
+
+    #[test]
+    fn test_write_read_v2() {
+        let idx_capacity: usize = 4;
+        let data_capacity: usize = 128;
+        let entry_size = INDEX_ENTRY_SIZE_V2;
+        let total_size = HEADER_SIZE + idx_capacity * entry_size + data_capacity;
+        let mut buf = vec![0u8; total_size];
+        let ptr = buf.as_mut_ptr();
+        let idx_mask = (idx_capacity - 1) as u64;
+
+        // Initialize V2 header
+        unsafe {
+            let header = ShmHeader::from_ptr_mut(ptr);
+            header.magic = MAGIC;
+            header.version = VERSION_V2;
+            header.idx_capacity = idx_capacity as u64;
+            header.data_capacity = data_capacity as u64;
+            header.tail = AtomicU64::new(0);
+            header.data_tail = AtomicU64::new(0);
+            header.closed = AtomicU64::new(0);
+            header.index_entry_size = entry_size as u64;
+        }
+
+        let index_base = unsafe { ptr.add(HEADER_SIZE) };
+        for i in 0..idx_capacity {
+            unsafe {
+                let entry_ptr = index_base.add(i * entry_size);
+                std::ptr::write_bytes(entry_ptr, 0, entry_size);
+                let seq_ptr = entry_ptr as *mut AtomicI64;
+                (*seq_ptr) = AtomicI64::new(-1);
+            }
+        }
+
+        // Write an account message with metadata
+        let msg = b"account-data-here";
+        let data_base_offset = HEADER_SIZE + idx_capacity * entry_size;
+        let data_ring =
+            unsafe { std::slice::from_raw_parts_mut(ptr.add(data_base_offset), data_capacity) };
+        copy_to_ring(data_ring, 0, msg);
+
+        let pos: u64 = 0;
+        let idx = (pos & idx_mask) as usize;
+        let entry = unsafe { ShmIndexEntryV2::from_ptr_mut(index_base.add(idx * entry_size)) };
+        entry.data_off = 0;
+        entry.data_len = msg.len() as u32;
+        entry.msg_type = MSG_TYPE_ACCOUNT;
+        entry.flags = FLAG_ACC_EXECUTABLE;
+        entry.slot = 42;
+
+        // Write a fake pubkey (32 bytes of 0xAA)
+        entry.meta[0..32].copy_from_slice(&[0xAA; 32]);
+        // Write a fake owner (32 bytes of 0xBB)
+        entry.meta[32..64].copy_from_slice(&[0xBB; 32]);
+        // Write lamports
+        entry.meta[64..72].copy_from_slice(&1000u64.to_le_bytes());
+
+        let header = unsafe { ShmHeader::from_ptr(ptr) };
+        header
+            .data_tail
+            .store(msg.len() as u64, Ordering::Release);
+        entry.seq.store(pos as i64, Ordering::Release);
+        header.tail.store(pos + 1, Ordering::Release);
+
+        // Read back and verify
+        let read_entry = unsafe {
+            ShmIndexEntryV2::from_ptr(index_base.add(idx * entry_size) as *const u8)
+        };
+        assert_eq!(read_entry.seq.load(Ordering::Acquire), 0);
+        assert_eq!(read_entry.msg_type, MSG_TYPE_ACCOUNT);
+        assert_eq!(read_entry.flags, FLAG_ACC_EXECUTABLE);
+        assert_eq!(read_entry.slot, 42);
+        assert_eq!(read_entry.data_len, msg.len() as u32);
+        assert_eq!(read_entry.account_pubkey(), &[0xAA; 32]);
+        assert_eq!(read_entry.account_owner(), &[0xBB; 32]);
+        assert_eq!(read_entry.account_lamports(), 1000);
+
+        // Verify data ring
+        let data_ring_ro = unsafe {
+            std::slice::from_raw_parts(ptr.add(data_base_offset) as *const u8, data_capacity)
+        };
+        let mut result = vec![0u8; msg.len()];
+        copy_from_ring(data_ring_ro, 0, msg.len(), &mut result);
+        assert_eq!(&result, msg);
+    }
+
+    #[test]
+    fn test_write_read_v2_transaction() {
+        let idx_capacity: usize = 4;
+        let data_capacity: usize = 128;
+        let entry_size = INDEX_ENTRY_SIZE_V2;
+        let total_size = HEADER_SIZE + idx_capacity * entry_size + data_capacity;
+        let mut buf = vec![0u8; total_size];
+        let ptr = buf.as_mut_ptr();
+        let idx_mask = (idx_capacity - 1) as u64;
+
+        unsafe {
+            let header = ShmHeader::from_ptr_mut(ptr);
+            header.magic = MAGIC;
+            header.version = VERSION_V2;
+            header.idx_capacity = idx_capacity as u64;
+            header.data_capacity = data_capacity as u64;
+            header.tail = AtomicU64::new(0);
+            header.data_tail = AtomicU64::new(0);
+            header.closed = AtomicU64::new(0);
+            header.index_entry_size = entry_size as u64;
+        }
+
+        let index_base = unsafe { ptr.add(HEADER_SIZE) };
+        for i in 0..idx_capacity {
+            unsafe {
+                let entry_ptr = index_base.add(i * entry_size);
+                std::ptr::write_bytes(entry_ptr, 0, entry_size);
+                let seq_ptr = entry_ptr as *mut AtomicI64;
+                (*seq_ptr) = AtomicI64::new(-1);
+            }
+        }
+
+        let msg = b"tx-data";
+        let data_base_offset = HEADER_SIZE + idx_capacity * entry_size;
+        let data_ring =
+            unsafe { std::slice::from_raw_parts_mut(ptr.add(data_base_offset), data_capacity) };
+        copy_to_ring(data_ring, 0, msg);
+
+        let pos: u64 = 0;
+        let idx = (pos & idx_mask) as usize;
+        let entry = unsafe { ShmIndexEntryV2::from_ptr_mut(index_base.add(idx * entry_size)) };
+        entry.data_off = 0;
+        entry.data_len = msg.len() as u32;
+        entry.msg_type = MSG_TYPE_TRANSACTION;
+        entry.flags = FLAG_TX_IS_VOTE | FLAG_TX_FAILED;
+        entry.slot = 100;
+        // Signature: 64 bytes of 0xCC
+        entry.meta[0..64].copy_from_slice(&[0xCC; 64]);
+
+        let header = unsafe { ShmHeader::from_ptr(ptr) };
+        header.data_tail.store(msg.len() as u64, Ordering::Release);
+        entry.seq.store(pos as i64, Ordering::Release);
+        header.tail.store(pos + 1, Ordering::Release);
+
+        let read_entry = unsafe {
+            ShmIndexEntryV2::from_ptr(index_base.add(idx * entry_size) as *const u8)
+        };
+        assert_eq!(read_entry.msg_type, MSG_TYPE_TRANSACTION);
+        assert_eq!(read_entry.flags & FLAG_TX_IS_VOTE, FLAG_TX_IS_VOTE);
+        assert_eq!(read_entry.flags & FLAG_TX_FAILED, FLAG_TX_FAILED);
+        assert_eq!(read_entry.tx_signature(), &[0xCC; 64]);
+        assert_eq!(read_entry.slot, 100);
     }
 }
