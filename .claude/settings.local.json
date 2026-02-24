@@ -20,7 +20,9 @@
       "Bash($SSH \"cat:*)",
       "Bash(SSH=\"ssh -p 40102 -i C:/Users/kp6c6/.ssh/bubba.key bubba@138.199.142.171\":*)",
       "Bash(SSH=\"ssh -p 40102 -i C:/Users/kp6c6/.ssh/bubba.key -o StrictHostKeyChecking=no bubba@138.199.142.171\")",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "WebFetch(domain:runs.solstack.app)",
+      "Bash(curl:*)"
     ]
   }
 }

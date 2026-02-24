@@ -46,11 +46,10 @@ use {
         future::Future,
         pin::Pin,
         sync::{
-            Arc, Mutex, MutexGuard,
+            Arc, Condvar, Mutex, MutexGuard,
             atomic::{AtomicU64, Ordering},
         },
         task::{Context, Poll, Waker},
-        thread::sleep,
         time::{Duration, SystemTime},
     },
     tokio_util::sync::CancellationToken,
@@ -77,6 +76,7 @@ pub struct GrpcServer {
     ping_interval: Duration,
     subscribe_id: Arc<AtomicU64>,
     subscribe_clients: Arc<SegQueue<SubscribeClient>>,
+    client_notify: Arc<(Mutex<()>, Condvar)>,
     subscribe_messages_len_max: usize,
     subscribe_messages_replay_len_max: usize,
 }
@@ -122,6 +122,7 @@ impl GrpcServer {
             ping_interval: config.stream.ping_interval,
             subscribe_id: Arc::new(AtomicU64::new(0)),
             subscribe_clients: Arc::new(SegQueue::new()),
+            client_notify: Arc::new((Mutex::new(()), Condvar::new())),
             subscribe_messages_len_max: config.stream.messages_len_max,
             subscribe_messages_replay_len_max: config.stream.messages_replay_len_max,
         };
@@ -239,6 +240,7 @@ impl GrpcServer {
     #[inline]
     fn push_client(&self, client: SubscribeClient) {
         self.subscribe_clients.push(client);
+        self.client_notify.1.notify_one();
     }
 
     #[inline]
@@ -271,7 +273,7 @@ impl GrpcServer {
 
             let Some(message) = receiver.try_recv(CommitmentLevel::Processed, head)? else {
                 counter = COUNTER_LIMIT;
-                sleep(Duration::from_micros(100));
+                receiver.wait_for_messages(Duration::from_micros(100));
                 continue;
             };
             head += 1;
@@ -300,28 +302,31 @@ impl GrpcServer {
 
         let receiver = self.messages.to_receiver();
         let mut ticks_without_messages = 0;
-        const SHUTDOWN_COUNTER_LIMIT: i32 = 50_000;
-        let mut shutdown_counter = 0;
         let mut prev_client = None;
         loop {
-            shutdown_counter += 1;
-            if shutdown_counter > SHUTDOWN_COUNTER_LIMIT {
-                shutdown_counter = 0;
+            // get client and state
+            let Some(client) = self.pop_client(prev_client.take()) else {
+                // No clients — wait on Condvar instead of spinning
+                let (lock, cvar) = &*self.client_notify;
+                let guard = lock.lock().unwrap();
+                // Re-check after acquiring lock to avoid race
+                if self.subscribe_clients.is_empty() {
+                    let _ = cvar.wait_timeout(guard, Duration::from_secs(1)).unwrap();
+                }
                 if shutdown.is_cancelled() {
                     while self.pop_client(None).is_some() {}
                     info!("gRPC worker#{index:02} shutdown");
                     return Ok(());
                 }
-            }
-
-            // get client and state
-            let Some(client) = self.pop_client(prev_client.take()) else {
-                shutdown_counter += 9;
-                sleep(Duration::from_micros(1));
                 continue;
             };
             let mut state = client.state_lock();
             if state.finished {
+                if shutdown.is_cancelled() {
+                    while self.pop_client(None).is_some() {}
+                    info!("gRPC worker#{index:02} shutdown");
+                    return Ok(());
+                }
                 continue;
             }
             let ts = Instant::now();
@@ -332,6 +337,11 @@ impl GrpcServer {
                 _ => {
                     drop(state);
                     prev_client = Some(client);
+                    if shutdown.is_cancelled() {
+                        while self.pop_client(None).is_some() {}
+                        info!("gRPC worker#{index:02} shutdown");
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -390,13 +400,13 @@ impl GrpcServer {
                 prev_client = Some(client);
             }
 
-            // sleep a little if no new messages during some ticks
+            // wait for messages instead of spinning when idle
             if ticks_without_messages >= ticks_without_messages_max {
                 ticks_without_messages = 0;
                 if let Some(client) = prev_client.take() {
                     self.push_client(client);
                 }
-                sleep(Duration::from_micros(1));
+                receiver.wait_for_messages(Duration::from_millis(1));
             }
         }
     }

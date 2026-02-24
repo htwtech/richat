@@ -33,10 +33,11 @@ use {
         hash::{BuildHasher, Hash, Hasher},
         pin::Pin,
         sync::{
-            Arc, Mutex, MutexGuard,
+            Arc, Condvar, Mutex, MutexGuard,
             atomic::{AtomicU64, Ordering},
         },
         task::{Context, Poll, Waker},
+        time::Duration,
     },
     tokio_util::sync::CancellationToken,
     tracing::debug,
@@ -267,11 +268,11 @@ impl Messages {
 
         let max_messages = config.max_messages.next_power_of_two();
         let messages = Self {
-            shared_processed: Arc::new(SharedChannel::new(max_messages, richat)),
+            shared_processed: Arc::new(SharedChannel::new(max_messages, richat, grpc)),
             shared_confirmed: (grpc || pubsub)
-                .then(|| Arc::new(SharedChannel::new(max_messages, richat))),
+                .then(|| Arc::new(SharedChannel::new(max_messages, richat, grpc))),
             shared_finalized: (grpc || pubsub)
-                .then(|| Arc::new(SharedChannel::new(max_messages, richat))),
+                .then(|| Arc::new(SharedChannel::new(max_messages, richat, grpc))),
             max_messages,
             max_bytes: config.max_bytes,
             parser,
@@ -826,6 +827,11 @@ impl SenderShared {
         // store new position for receivers
         self.shared.tail.store(self.tail, Ordering::Relaxed);
 
+        // notify sync waiters (gRPC workers)
+        if let Some((_, cvar)) = &self.shared.sync_notify {
+            cvar.notify_all();
+        }
+
         // update slot head info
         slots_lock
             .entry(slot)
@@ -947,6 +953,16 @@ impl ReceiverSync {
 
         Ok(None)
     }
+
+    /// Block until new messages may be available, or timeout.
+    pub fn wait_for_messages(&self, timeout: Duration) {
+        if let Some((lock, cvar)) = &self.shared_processed.sync_notify {
+            let guard = lock.lock().unwrap();
+            let _ = cvar.wait_timeout(guard, timeout).unwrap();
+        } else {
+            std::thread::sleep(timeout);
+        }
+    }
 }
 
 pub struct SharedChannel {
@@ -955,6 +971,7 @@ pub struct SharedChannel {
     buffer: Box<[Mutex<Item>]>,
     slots: Mutex<BTreeMap<Slot, SlotHead>>,
     wakers: Option<Mutex<Vec<Waker>>>,
+    sync_notify: Option<(Mutex<()>, Condvar)>,
 }
 
 impl fmt::Debug for SharedChannel {
@@ -964,7 +981,7 @@ impl fmt::Debug for SharedChannel {
 }
 
 impl SharedChannel {
-    fn new(max_messages: usize, richat: bool) -> Self {
+    fn new(max_messages: usize, richat: bool, grpc: bool) -> Self {
         let mut buffer = Vec::with_capacity(max_messages);
         for i in 0..max_messages {
             buffer.push(Mutex::new(Item {
@@ -981,6 +998,7 @@ impl SharedChannel {
             buffer: buffer.into_boxed_slice(),
             slots: Mutex::default(),
             wakers: richat.then_some(Mutex::default()),
+            sync_notify: grpc.then(|| (Mutex::new(()), Condvar::new())),
         }
     }
 
