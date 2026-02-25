@@ -50,6 +50,9 @@ pub struct ConfigShmPreFilter {
     /// If true, skip all entry messages
     #[serde(default)]
     pub disable_entries: bool,
+    /// Skip transactions not involving these accounts (bloom filter check, empty = accept all)
+    #[serde(default, deserialize_with = "deserialize_pubkey_set")]
+    pub transaction_accounts: HashSet<Pubkey>,
 }
 
 fn deserialize_pubkey_set<'de, D>(deserializer: D) -> Result<HashSet<Pubkey>, D::Error>

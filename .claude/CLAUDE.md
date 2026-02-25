@@ -23,47 +23,29 @@ RICHAT_DISPLAY_VERSION="9.0.0-custom" RICHAT_DISPLAY_PACKAGE="my-richat" cargo b
 
 Defined in `richat/src/version.rs` via `option_env!()`.
 
-## Branch: update-shm1 — SHM Transport Optimization
+## Branch: shm-metadata-v2 — SHM V2 Metadata + Zero-Parse Pre-Filtering
 
-### What was done
-4 optimizations to eliminate unnecessary hops in SHM data path:
+Full status, next steps, and file list: **`docs/shm-metadata-v2-status.md`**
 
-1. **encode_into() methods** (`plugin-agave/src/protobuf/message.rs`)
-   - `encode_into()`, `encode_into_with_timestamp()`, `encode_prost_into()`, `encode_raw_into()`
-   - Encode into existing `Vec<u8>` buffer instead of allocating new one
-   - `buf.clear()` reuses capacity — zero alloc after warmup
+### Summary
+- SHM V2 index entries (128B): inline msg_type, flags, slot, meta[96]
+- Transaction bloom filter (256-bit, k=5) in meta[64..96] for account pre-filtering
+- `extract_shm_meta()` in plugin builds V2 metadata from ProtobufMessage
+- Benchmark: bloom pre-filter is **~1370× faster** than full protobuf parse for non-matching txs
+- Architecture doc: `docs/architecture-shm-v2.md`
+- gRPC pricing analysis: `docs/grpc-subscription-load-ranking.md`
 
-2. **encode_into tests** (`plugin-agave/src/protobuf/mod.rs`)
-   - 5 tests: `test_encode_into_{account,block_meta,entry,slot,transaction}`
-   - Verify `encode_into() == encode()` for both Prost and Raw encoders
+### Key files changed
+- `shared/src/transports/shm.rs` — ShmIndexEntryV2, bloom256, ShmWriteMeta
+- `plugin-agave/src/plugin.rs` — extract_shm_meta(), dispatch() with V2
+- `richat/src/source.rs` — ShmPreFilter with bloom check
+- `richat/src/config.rs` — ConfigShmPreFilter
+- `benches/benches/bloom-prefilter/` — criterion benchmark (NEW)
 
-3. **Sender refactor** (`plugin-agave/src/channel.rs`)
-   - `push()` -> delegates to `push_inner()`
-   - New `push_pre_encoded()` accepts already-encoded bytes (for combined mode)
+## Previous branch: update-shm1 — SHM Transport Optimization
 
-4. **ShmDirectWriter** (`shared/src/transports/shm.rs`)
-   - Direct mmap ring buffer writer, bypasses async channel/kanal
-   - Extracted `init_shm_mmap()` shared init function (used by both ShmServer and ShmDirectWriter)
-   - `write()`, `close()`, `remove_file()` methods
-
-5. **Plugin integration** (`plugin-agave/src/plugin.rs`)
-   - `dispatch()` method with 3 modes: SHM-only, channel-only, combined
-   - Thread-local `ENCODE_BUF` for zero-alloc encoding
-   - `PluginInner.messages` is now `Option<Sender>` (None in SHM-only mode)
-   - `PluginInner.shm_direct: Option<Arc<ShmDirectWriter>>`
-   - ShmServer::spawn() no longer called when ShmDirectWriter is used
-   - All Geyser callbacks use `dispatch()` instead of `messages.push()`
-
-### Build status
-- `cargo check` — OK (0 errors, 0 warnings)
-- `cargo test` — 19/19 passed
-- `cargo build --release` — OK on tds2
-
-### Performance gains (SHM-only mode)
-| Metric | Before | After |
-|--------|--------|-------|
-| Alloc/msg | 1-2 (Vec+Arc) | 0 (after warmup) |
-| Mutex locks/msg | 2 | 1 |
-| Channel hops | 2 | 0 |
-| memcpy | 2 | 1 |
-| Thread switches | 2 | 0 |
+Merged into shm-metadata-v2. Key optimizations:
+- `encode_into()` — zero-alloc encoding into reusable buffer
+- `ShmDirectWriter` — direct mmap write, bypasses async channels
+- `dispatch()` — 3 modes: SHM-only, channel-only, combined
+- `push_pre_encoded()` — encode once for both SHM and gRPC/QUIC

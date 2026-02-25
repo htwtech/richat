@@ -166,7 +166,7 @@ pub struct ShmIndexEntryV2 {
 
     // --- Type-specific metadata (96B) ---
     // Account: pubkey[32] + owner[32] + lamports[8] + pad[24]
-    // Transaction: signature[64] + pad[32]
+    // Transaction: signature[64] + account_bloom[32]
     // Slot: parent[8] + pad[88]
     // Entry: index[8] + executed_tx_count[8] + pad[80]
     // BlockMeta: pad[96]
@@ -214,6 +214,12 @@ impl ShmIndexEntryV2 {
     #[inline]
     pub fn tx_signature(&self) -> &[u8; 64] {
         self.meta[0..64].try_into().unwrap()
+    }
+
+    /// Transaction account bloom filter (bytes 64..96 of meta). Only valid when msg_type == MSG_TYPE_TRANSACTION.
+    #[inline]
+    pub fn tx_account_bloom(&self) -> &[u8; 32] {
+        self.meta[64..96].try_into().unwrap()
     }
 
     /// Slot parent (first 8 bytes of meta). Only valid when msg_type == MSG_TYPE_SLOT.
@@ -754,6 +760,47 @@ impl ShmServer {
     }
 }
 
+// --- Bloom filter (256-bit, k=5) for transaction account keys ---
+
+pub mod bloom256 {
+    const K: u32 = 5;
+    const M: u32 = 256;
+
+    /// Insert a 32-byte key into a 256-bit bloom filter.
+    /// Uses 5 hash functions derived from non-overlapping 4-byte slices of the key.
+    #[inline]
+    pub fn insert(filter: &mut [u8; 32], key: &[u8; 32]) {
+        for i in 0..K as usize {
+            let h = u32::from_le_bytes([
+                key[i * 4],
+                key[i * 4 + 1],
+                key[i * 4 + 2],
+                key[i * 4 + 3],
+            ]) % M;
+            filter[(h / 8) as usize] |= 1 << (h % 8);
+        }
+    }
+
+    /// Check if a 32-byte key may be in the bloom filter.
+    /// Returns `false` if the key is definitely not present (no false negatives).
+    /// Returns `true` if the key might be present (possible false positives).
+    #[inline]
+    pub fn may_contain(filter: &[u8; 32], key: &[u8; 32]) -> bool {
+        for i in 0..K as usize {
+            let h = u32::from_le_bytes([
+                key[i * 4],
+                key[i * 4 + 1],
+                key[i * 4 + 2],
+                key[i * 4 + 3],
+            ]) % M;
+            if filter[(h / 8) as usize] & (1 << (h % 8)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -1181,5 +1228,59 @@ mod tests {
         assert_eq!(read_entry.flags & FLAG_TX_FAILED, FLAG_TX_FAILED);
         assert_eq!(read_entry.tx_signature(), &[0xCC; 64]);
         assert_eq!(read_entry.slot, 100);
+    }
+
+    #[test]
+    fn test_bloom256_insert_contains() {
+        use super::bloom256;
+
+        let mut filter = [0u8; 32];
+        let key_a = [0xAAu8; 32];
+        let key_b = [0xBBu8; 32];
+
+        bloom256::insert(&mut filter, &key_a);
+        bloom256::insert(&mut filter, &key_b);
+
+        assert!(bloom256::may_contain(&filter, &key_a));
+        assert!(bloom256::may_contain(&filter, &key_b));
+    }
+
+    #[test]
+    fn test_bloom256_no_false_negatives() {
+        use super::bloom256;
+
+        let mut filter = [0u8; 32];
+        // Insert 20 distinct keys
+        let mut keys = Vec::new();
+        for i in 0u8..20 {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            key[1] = i.wrapping_mul(7);
+            key[4] = i.wrapping_mul(13);
+            key[8] = i.wrapping_mul(19);
+            key[12] = i.wrapping_mul(31);
+            key[16] = i.wrapping_mul(37);
+            keys.push(key);
+            bloom256::insert(&mut filter, &key);
+        }
+
+        // Every inserted key must be found — zero false negatives
+        for key in &keys {
+            assert!(
+                bloom256::may_contain(&filter, key),
+                "false negative for key starting with {}",
+                key[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_bloom256_empty() {
+        use super::bloom256;
+
+        let filter = [0u8; 32];
+        let key = [0x42u8; 32];
+        // Empty filter should not contain anything
+        assert!(!bloom256::may_contain(&filter, &key));
     }
 }

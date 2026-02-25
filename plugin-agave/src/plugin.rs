@@ -18,7 +18,7 @@ use {
         grpc::GrpcServer,
         quic::QuicServer,
         shm::{
-            ShmDirectWriter, ShmWriteMeta,
+            ShmDirectWriter, ShmWriteMeta, bloom256,
             FLAG_ACC_EXECUTABLE, FLAG_ACC_HAS_TXN_SIG,
             FLAG_TX_FAILED, FLAG_TX_IS_VOTE,
             MSG_TYPE_ACCOUNT, MSG_TYPE_BLOCK_META, MSG_TYPE_ENTRY, MSG_TYPE_SLOT,
@@ -26,6 +26,7 @@ use {
         },
     },
     solana_clock::Slot,
+    solana_message::VersionedMessage,
     std::{cell::RefCell, fmt, sync::Arc, time::Duration},
     tokio::{runtime::Runtime, task::JoinError},
     tokio_util::sync::CancellationToken,
@@ -144,6 +145,22 @@ impl PluginInner {
                 let sig = transaction.signature.as_ref();
                 let sig_len = sig.len().min(64);
                 wm.meta[..sig_len].copy_from_slice(&sig[..sig_len]);
+                // account bloom filter → meta[64..96]
+                let mut bloom = [0u8; 32];
+                let account_keys = match &transaction.transaction.message {
+                    VersionedMessage::Legacy(msg) => &msg.account_keys,
+                    VersionedMessage::V0(msg) => &msg.account_keys,
+                };
+                for key in account_keys {
+                    bloom256::insert(&mut bloom, key.as_ref().try_into().unwrap());
+                }
+                for key in &transaction.transaction_status_meta.loaded_addresses.writable {
+                    bloom256::insert(&mut bloom, key.as_ref().try_into().unwrap());
+                }
+                for key in &transaction.transaction_status_meta.loaded_addresses.readonly {
+                    bloom256::insert(&mut bloom, key.as_ref().try_into().unwrap());
+                }
+                wm.meta[64..96].copy_from_slice(&bloom);
             }
             ProtobufMessage::Slot {
                 status, parent, ..

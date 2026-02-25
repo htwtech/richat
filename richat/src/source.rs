@@ -114,6 +114,7 @@ struct ShmPreFilter {
     exclude_failed: bool,
     account_pubkeys: HashSet<[u8; 32]>,
     account_owners: HashSet<[u8; 32]>,
+    transaction_accounts: HashSet<[u8; 32]>,
 }
 
 impl ShmPreFilter {
@@ -132,6 +133,11 @@ impl ShmPreFilter {
                 .collect(),
             account_owners: config
                 .account_owners
+                .iter()
+                .map(|pk| pk.to_bytes())
+                .collect(),
+            transaction_accounts: config
+                .transaction_accounts
                 .iter()
                 .map(|pk| pk.to_bytes())
                 .collect(),
@@ -174,6 +180,14 @@ impl ShmPreFilter {
                 if self.exclude_failed && (meta.flags & FLAG_TX_FAILED != 0) {
                     return false;
                 }
+                if !self.transaction_accounts.is_empty() {
+                    let bloom: &[u8; 32] = meta.meta[64..96].try_into().unwrap();
+                    if !self.transaction_accounts.iter().any(|key| {
+                        richat_shared::transports::shm::bloom256::may_contain(bloom, key)
+                    }) {
+                        return false;
+                    }
+                }
                 true
             }
             MSG_TYPE_ENTRY => !self.disable_entries,
@@ -191,6 +205,7 @@ impl ShmPreFilter {
             && !self.exclude_failed
             && self.account_pubkeys.is_empty()
             && self.account_owners.is_empty()
+            && self.transaction_accounts.is_empty()
     }
 }
 

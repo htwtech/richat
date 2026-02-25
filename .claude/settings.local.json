@@ -28,7 +28,8 @@
       "Bash(done)",
       "Bash(for f in plugin-agave/src/config.rs plugin-agave/src/plugin.rs richat/src/channel.rs)",
       "WebFetch(domain:docs.rs)",
-      "WebFetch(domain:docs.anza.xyz)"
+      "WebFetch(domain:docs.anza.xyz)",
+      "Bash(git commit:*)"
     ]
   }
 }

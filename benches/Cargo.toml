@@ -41,6 +41,11 @@ prost-types = { workspace = true }
 richat-filter = { workspace = true }
 richat-plugin-agave = { workspace = true }
 richat-proto = { workspace = true, features = ["yellowstone-grpc-plugin"] }
+richat-shared = { workspace = true }
+
+[[bench]]
+name = "bloom-prefilter"
+harness = false
 
 [lints]
 workspace = true
