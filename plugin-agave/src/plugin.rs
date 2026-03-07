@@ -97,16 +97,13 @@ impl PluginInner {
             (None, Some(sender)) => {
                 sender.push(message, self.encoder);
             }
-            // Combined: encode once, write to SHM with V2 metadata, push pre-encoded to channel
+            // Combined: encode once into owned Vec, write to SHM, move into channel (no clone)
             (Some(shm), Some(sender)) => {
                 let slot = message.get_slot();
                 let write_meta = Self::extract_shm_meta(&message);
-                ENCODE_BUF.with(|buf| {
-                    let mut buf = buf.borrow_mut();
-                    message.encode_into(self.encoder, &mut buf);
-                    shm.write(&buf, slot, &write_meta);
-                    sender.push_pre_encoded(message, buf.to_vec(), self.encoder);
-                });
+                let data = message.encode(self.encoder);
+                shm.write(&data, slot, &write_meta);
+                sender.push_pre_encoded(message, data, self.encoder);
             }
             (None, None) => {}
         }

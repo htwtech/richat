@@ -41,7 +41,7 @@ use {
     solana_pubkey::Pubkey,
     std::{
         borrow::Cow,
-        collections::{HashSet, LinkedList},
+        collections::{HashSet, VecDeque},
         fmt,
         future::Future,
         pin::Pin,
@@ -324,23 +324,11 @@ impl GrpcServer {
                 }
                 continue;
             };
-            let mut state = client.state_lock();
-            if state.finished {
-                if shutdown.is_cancelled() {
-                    while self.pop_client(None).is_some() {}
-                    info!("gRPC worker#{index:02} shutdown");
-                    return Ok(());
-                }
-                continue;
-            }
-            let ts = Instant::now();
-
-            // filter messages
-            let mut head = match (state.filter.is_some(), state.head) {
-                (true, IndexLocation::Memory(head)) => head,
-                _ => {
+            // Phase 1: Briefly lock state to read filter, commitment, head
+            let (filter, commitment, mut head, messages_len_max) = {
+                let state = client.state_lock();
+                if state.finished {
                     drop(state);
-                    prev_client = Some(client);
                     if shutdown.is_cancelled() {
                         while self.pop_client(None).is_some() {}
                         info!("gRPC worker#{index:02} shutdown");
@@ -348,48 +336,79 @@ impl GrpcServer {
                     }
                     continue;
                 }
+                match (state.filter.as_ref(), state.head) {
+                    (Some(filter), IndexLocation::Memory(head)) => {
+                        let filter = Arc::clone(filter);
+                        let commitment = state.commitment;
+                        let messages_len_max = state.messages_len_max;
+                        drop(state);
+                        (filter, commitment, head, messages_len_max)
+                    }
+                    _ => {
+                        drop(state);
+                        prev_client = Some(client);
+                        if shutdown.is_cancelled() {
+                            while self.pop_client(None).is_some() {}
+                            info!("gRPC worker#{index:02} shutdown");
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                }
             };
 
-            let messages_cache = match state.commitment {
+            let ts = Instant::now();
+            let messages_cache = match commitment {
                 CommitmentLevel::Processed => &mut messages_cache_processed,
                 CommitmentLevel::Confirmed => &mut messages_cache_confirmed,
                 CommitmentLevel::Finalized => &mut messages_cache_finalized,
             };
+
+            // Phase 2: Filter + encode messages WITHOUT holding state lock
             let mut errored = false;
             let mut messages_counter = 0;
-            while !state.is_full() && messages_counter < messages_max_per_tick {
-                let message = match messages_cache.try_recv(&receiver, state.commitment, head) {
+            let mut encoded_items =
+                SmallVec::<[(GrpcSubscribeMessage, Vec<u8>); 8]>::new();
+            let mut encoded_len: usize = 0;
+            while encoded_len <= messages_len_max && messages_counter < messages_max_per_tick {
+                let message = match messages_cache.try_recv(&receiver, commitment, head) {
                     Ok(Some(message)) => {
                         messages_counter += 1;
                         head += 1;
-                        state.head = IndexLocation::Memory(head);
                         message
                     }
                     Ok(None) => break,
                     Err(RecvError::Lagged) => {
-                        state.push_error(Status::data_loss("lagged"));
                         errored = true;
                         break;
                     }
                     Err(RecvError::Closed) => {
-                        state.push_error(Status::data_loss("closed"));
                         errored = true;
                         break;
                     }
                 };
 
                 let message_ref: MessageRef = message.as_ref().into();
-                if let Some(filter) = state.filter.as_ref() {
-                    let items = filter
-                        .get_updates_ref(message_ref, state.commitment)
-                        .iter()
-                        .map(|msg| ((&msg.filtered_update).into(), msg.encode_to_vec()))
-                        .collect::<SmallVec<[(GrpcSubscribeMessage, Vec<u8>); 2]>>();
+                let items = filter
+                    .get_updates_ref(message_ref, commitment)
+                    .iter()
+                    .map(|msg| ((&msg.filtered_update).into(), msg.encode_to_vec()))
+                    .collect::<SmallVec<[(GrpcSubscribeMessage, Vec<u8>); 2]>>();
 
-                    for (message, data) in items {
-                        state.push_message(message, data);
-                    }
+                for item in items {
+                    encoded_len += item.1.len();
+                    encoded_items.push(item);
                 }
+            }
+
+            // Phase 3: Briefly lock state to push encoded messages
+            let mut state = client.state_lock();
+            if errored {
+                state.push_error(Status::data_loss("lagged or closed"));
+            }
+            state.head = IndexLocation::Memory(head);
+            for (message, data) in encoded_items {
+                state.push_message(message, data);
             }
             if messages_counter == 0 {
                 ticks_without_messages += 1;
@@ -410,7 +429,7 @@ impl GrpcServer {
                 if let Some(client) = prev_client.take() {
                     self.push_client(client);
                 }
-                receiver.wait_for_messages(Duration::from_millis(1));
+                receiver.wait_for_messages(Duration::from_micros(100));
             }
         }
     }
@@ -520,7 +539,7 @@ impl GrpcServer {
                                             .map_err(Status::internal)?;
                                     }
                                 }
-                                state.filter = Some(filter);
+                                state.filter = Some(Arc::new(filter));
                                 Ok::<(), Status>(())
                             }) {
                                 warn!(id, %error, "failed to handle request");
@@ -795,12 +814,12 @@ pub struct SubscribeClientState {
     x_subscription_id: Arc<str>,
     commitment: CommitmentLevel,
     pub head: IndexLocation,
-    pub filter: Option<Filter>,
+    pub filter: Option<Arc<Filter>>,
     messages_error: Option<Status>,
     messages_len_total: usize,
     messages_len_max: usize,
     messages_replay_len_max: usize,
-    messages: LinkedList<(GrpcSubscribeMessage, Vec<u8>)>,
+    messages: VecDeque<(GrpcSubscribeMessage, Vec<u8>)>,
     messages_waker: Option<Waker>,
     metric_cpu_usage: Gauge,
 }
@@ -848,7 +867,7 @@ impl SubscribeClientState {
             messages_len_total: 0,
             messages_len_max,
             messages_replay_len_max,
-            messages: LinkedList::new(),
+            messages: VecDeque::new(),
             messages_waker: None,
             metric_cpu_usage,
         }

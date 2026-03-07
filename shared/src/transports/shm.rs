@@ -297,6 +297,29 @@ pub fn copy_to_ring(ring: &mut [u8], offset: usize, src: &[u8]) {
     }
 }
 
+/// Copy `src` into a ring buffer using raw pointers.
+/// Allows concurrent non-overlapping writes to the same ring buffer.
+///
+/// # Safety
+/// - `base` must point to a valid writable region of at least `ring_len` bytes
+/// - The destination range `[offset..offset+src.len()]` (with wrap) must not
+///   overlap with any concurrent write to the same ring
+#[inline]
+unsafe fn copy_to_ring_raw(base: *mut u8, ring_len: usize, offset: usize, src: &[u8]) {
+    debug_assert!(offset < ring_len);
+    let first = ring_len - offset;
+    if first >= src.len() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(offset), src.len());
+        }
+    } else {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(offset), first);
+            std::ptr::copy_nonoverlapping(src.as_ptr().add(first), base, src.len() - first);
+        }
+    }
+}
+
 // --- Errors ---
 
 #[derive(Debug, Error)]
@@ -507,40 +530,61 @@ impl ShmDirectWriter {
     }
 
     /// Write bytes into the ring buffer with V2 metadata.
+    ///
+    /// Split into phases to minimize Mutex hold time:
+    /// 1. Reserve positions (under lock — fast, only arithmetic)
+    /// 2. Copy data + write metadata (no lock — concurrent with other writers)
+    /// 3. Commit entry (atomic seq store)
+    /// 4. Advance tail (lock-free CAS loop)
     #[inline]
     pub fn write(&self, data: &[u8], slot: u64, write_meta: &ShmWriteMeta) {
-        let Some(mut inner) = self.lock_inner() else {
-            return;
-        };
-
-        let ptr = inner.mmap.as_mut_ptr();
         let data_len = data.len();
-        let idx = (inner.pos & inner.idx_mask) as usize;
-        let entry_size = inner.entry_size;
-        let data_base_offset = HEADER_SIZE + inner.idx_capacity * entry_size;
-
-        // Check data length fits in u32 (index entry field)
         if data_len > u32::MAX as usize {
             error!("SHM message too large ({data_len} bytes), dropping");
             return;
         }
 
-        // 1. Write data bytes into data ring with wrap-around
-        let data_ring_offset = (inner.data_pos % inner.data_capacity as u64) as usize;
-        // SAFETY: data region is within mmap bounds, we are the sole writer (protected by Mutex)
-        let data_ring = unsafe {
-            std::slice::from_raw_parts_mut(ptr.add(data_base_offset), inner.data_capacity)
-        };
-        copy_to_ring(data_ring, data_ring_offset, data);
+        // Phase 1: Reserve positions under lock (fast — only arithmetic + atomic store)
+        let (ptr, pos, data_pos, idx, entry_size, data_base_offset, data_ring_offset, data_capacity, idx_mask) = {
+            let Some(mut inner) = self.lock_inner() else {
+                return;
+            };
 
-        // 2. Write V2 index entry metadata
-        // SAFETY: index region is within bounds
+            let ptr = inner.mmap.as_mut_ptr();
+            let pos = inner.pos;
+            let data_pos = inner.data_pos;
+            let idx = (pos & inner.idx_mask) as usize;
+            let entry_size = inner.entry_size;
+            let data_base_offset = HEADER_SIZE + inner.idx_capacity * entry_size;
+            let data_ring_offset = (data_pos % inner.data_capacity as u64) as usize;
+            let data_capacity = inner.data_capacity;
+            let idx_mask = inner.idx_mask;
+
+            // Advance positions — reserves our exclusive region
+            inner.pos += 1;
+            inner.data_pos += data_len as u64;
+
+            // Update data_tail (Relaxed: readers synchronize via entry.seq Acquire)
+            let header = unsafe { ShmHeader::from_ptr(ptr) };
+            header.data_tail.store(inner.data_pos, Ordering::Relaxed);
+
+            (ptr, pos, data_pos, idx, entry_size, data_base_offset, data_ring_offset, data_capacity, idx_mask)
+        }; // Lock released — other writers can now reserve their own slots
+
+        // Phase 2: Copy data into reserved region of data ring (no lock needed)
+        // SAFETY: ptr valid (mmap owned by self), region exclusively reserved above,
+        // raw pointers allow concurrent non-overlapping writes to the same ring
+        unsafe {
+            copy_to_ring_raw(ptr.add(data_base_offset), data_capacity, data_ring_offset, data);
+        }
+
+        // Phase 3: Write index entry metadata + commit
+        // SAFETY: entry at idx is exclusively ours (reserved via pos under Mutex),
+        // no other writer targets the same idx (sequential pos assignment)
         let entry = unsafe {
-            ShmIndexEntryV2::from_ptr_mut(
-                ptr.add(HEADER_SIZE + idx * entry_size),
-            )
+            ShmIndexEntryV2::from_ptr_mut(ptr.add(HEADER_SIZE + idx * entry_size))
         };
-        entry.data_off = inner.data_pos;
+        entry.data_off = data_pos;
         entry.data_len = data_len as u32;
         entry.msg_type = write_meta.msg_type;
         entry.flags = write_meta.flags;
@@ -548,21 +592,44 @@ impl ShmDirectWriter {
         entry.slot = slot;
         entry.meta.copy_from_slice(&write_meta.meta);
 
-        // 3. Advance data position
-        inner.data_pos += data_len as u64;
+        // COMMIT: make entry visible to readers (Release pairs with reader's Acquire)
+        entry.seq.store(pos as i64, Ordering::Release);
 
-        // 4. Update header.data_tail
+        // Phase 4: Advance header.tail past consecutively committed entries
+        // Multiple writers may finish out of order; tail only advances when all
+        // entries up to it are committed (seq == pos).
         let header = unsafe { ShmHeader::from_ptr(ptr) };
-        header.data_tail.store(inner.data_pos, Ordering::Relaxed);
-
-        // 5. COMMIT: set seq to pos
-        entry.seq.store(inner.pos as i64, Ordering::Release);
-
-        // 6. Advance position
-        inner.pos += 1;
-
-        // 7. Update header.tail
-        header.tail.store(inner.pos, Ordering::Release);
+        loop {
+            let current = header.tail.load(Ordering::Acquire);
+            if current > pos {
+                // Tail already advanced past our entry (another writer did it)
+                break;
+            }
+            // Check if the entry at current tail position is committed
+            let check_idx = (current & idx_mask) as usize;
+            let check_entry = unsafe {
+                ShmIndexEntryV2::from_ptr(ptr.add(HEADER_SIZE + check_idx * entry_size))
+            };
+            if check_entry.seq.load(Ordering::Acquire) != current as i64 {
+                // Entry not committed yet — its writer is still in Phase 2/3
+                break;
+            }
+            // Try to advance tail by one
+            if header
+                .tail
+                .compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                // Another writer advanced tail concurrently — retry
+                continue;
+            }
+            // Successfully advanced; loop to try advancing further
+        }
     }
 
     /// Mark SHM as closed.
