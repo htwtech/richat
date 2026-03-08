@@ -416,7 +416,7 @@ impl Messages {
             }
         } else {
             let index = self.get_shared(commitment).tail.load(Ordering::Relaxed);
-            Ok(IndexLocation::Memory(index))
+            Ok(IndexLocation::Memory(index.wrapping_add(1)))
         }
     }
 
@@ -471,7 +471,10 @@ impl Subscribe for Messages {
                 }
             }
         } else {
-            self.shared_processed.tail.load(Ordering::Relaxed)
+            self.shared_processed
+                .tail
+                .load(Ordering::Relaxed)
+                .wrapping_add(1)
         };
 
         let filter = filter.unwrap_or_default();
@@ -948,7 +951,7 @@ impl ReceiverSync {
         };
 
         let tail = shared.tail.load(Ordering::Relaxed);
-        if head < tail {
+        if head <= tail {
             let idx = shared.get_idx(head);
             let item = shared.buffer_idx(idx);
             if item.pos != head {

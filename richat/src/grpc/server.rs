@@ -82,6 +82,8 @@ pub struct GrpcServer {
 }
 
 impl GrpcServer {
+    const CLIENT_QUEUE_FULL_MSG: &str = "client queue is full";
+
     pub fn spawn(
         config: ConfigAppsGrpc,
         messages: Messages,
@@ -325,9 +327,19 @@ impl GrpcServer {
                 continue;
             };
             // Phase 1: Briefly lock state to read filter, commitment, head
-            let (filter, commitment, mut head, messages_len_max) = {
-                let state = client.state_lock();
+            let (filter, commitment, mut head, messages_len_budget) = {
+                let mut state = client.state_lock();
                 if state.finished {
+                    drop(state);
+                    if shutdown.is_cancelled() {
+                        while self.pop_client(None).is_some() {}
+                        info!("gRPC worker#{index:02} shutdown");
+                        return Ok(());
+                    }
+                    continue;
+                }
+                if state.is_full() {
+                    state.push_error(Status::resource_exhausted(Self::CLIENT_QUEUE_FULL_MSG));
                     drop(state);
                     if shutdown.is_cancelled() {
                         while self.pop_client(None).is_some() {}
@@ -340,9 +352,11 @@ impl GrpcServer {
                     (Some(filter), IndexLocation::Memory(head)) => {
                         let filter = Arc::clone(filter);
                         let commitment = state.commitment;
-                        let messages_len_max = state.messages_len_max;
+                        let messages_len_budget = state
+                            .messages_len_max
+                            .saturating_sub(state.messages_len_total);
                         drop(state);
-                        (filter, commitment, head, messages_len_max)
+                        (filter, commitment, head, messages_len_budget)
                     }
                     _ => {
                         drop(state);
@@ -370,7 +384,7 @@ impl GrpcServer {
             let mut encoded_items =
                 SmallVec::<[(GrpcSubscribeMessage, Vec<u8>); 8]>::new();
             let mut encoded_len: usize = 0;
-            while encoded_len <= messages_len_max && messages_counter < messages_max_per_tick {
+            while encoded_len <= messages_len_budget && messages_counter < messages_max_per_tick {
                 let message = match messages_cache.try_recv(&receiver, commitment, head) {
                     Ok(Some(message)) => {
                         messages_counter += 1;
@@ -408,7 +422,11 @@ impl GrpcServer {
             }
             state.head = IndexLocation::Memory(head);
             for (message, data) in encoded_items {
-                state.push_message(message, data);
+                if state.try_push_message_live(message, data).is_err() {
+                    state.push_error(Status::resource_exhausted(Self::CLIENT_QUEUE_FULL_MSG));
+                    errored = true;
+                    break;
+                }
             }
             if messages_counter == 0 {
                 ticks_without_messages += 1;
@@ -484,7 +502,13 @@ impl GrpcServer {
                             if ts.duration_since(ts_latest) > ping_interval {
                                 ts_latest = ts;
                                 let message = SubscribeClientState::create_ping();
-                                state.push_message(GrpcSubscribeMessage::Ping, message);
+                                if state
+                                    .try_push_message_live(GrpcSubscribeMessage::Ping, message)
+                                    .is_err()
+                                {
+                                    state.push_error(Status::resource_exhausted(Self::CLIENT_QUEUE_FULL_MSG));
+                                    break;
+                                }
                             }
                         }
                     }
@@ -504,7 +528,13 @@ impl GrpcServer {
                             if let Some(id) = get_ping(&message) {
                                 let message = SubscribeClientState::create_pong(id);
                                 let mut state = client.state_lock();
-                                state.push_message(GrpcSubscribeMessage::Pong, message);
+                                if state
+                                    .try_push_message_live(GrpcSubscribeMessage::Pong, message)
+                                    .is_err()
+                                {
+                                    state.push_error(Status::resource_exhausted(Self::CLIENT_QUEUE_FULL_MSG));
+                                    break;
+                                }
                                 continue;
                             }
 
@@ -894,11 +924,11 @@ impl SubscribeClientState {
     }
 
     const fn is_full(&self) -> bool {
-        self.messages_len_total > self.messages_len_max
+        self.messages_len_total >= self.messages_len_max
     }
 
     pub const fn is_full_replay(&self) -> bool {
-        self.messages_len_total > self.messages_replay_len_max
+        self.messages_len_total >= self.messages_replay_len_max
     }
 
     pub fn push_error(&mut self, error: Status) {
@@ -914,6 +944,22 @@ impl SubscribeClientState {
         if let Some(waker) = self.messages_waker.take() {
             waker.wake();
         }
+    }
+
+    pub fn try_push_message_live(
+        &mut self,
+        message: GrpcSubscribeMessage,
+        data: Vec<u8>,
+    ) -> Result<(), ()> {
+        if self
+            .messages_len_total
+            .saturating_add(data.len())
+            > self.messages_len_max
+        {
+            return Err(());
+        }
+        self.push_message(message, data);
+        Ok(())
     }
 
     fn pop_message(
