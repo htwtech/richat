@@ -1,9 +1,9 @@
 use {
     crate::{
-        config::ConfigChannelInner, metrics, storage::Storage,
+        config::ConfigChannelInner, grpc::server::SubscribeClient, metrics, storage::Storage,
         util::SpawnedThreads,
     },
-    ::metrics::{counter, gauge},
+    ::metrics::{Gauge, counter, gauge},
     foldhash::quality::RandomState,
     futures::stream::{Stream, StreamExt},
     richat_filter::{
@@ -248,6 +248,7 @@ impl Messages {
         parser: MessageParserEncoding,
         config: ConfigChannelInner,
         richat: bool,
+        grpc: bool,
         pubsub: bool,
         shutdown: CancellationToken,
     ) -> anyhow::Result<(Self, SpawnedThreads)> {
@@ -267,11 +268,11 @@ impl Messages {
 
         let max_messages = config.max_messages.next_power_of_two();
         let messages = Self {
-            shared_processed: Arc::new(SharedChannel::new(max_messages, richat)),
-            shared_confirmed: pubsub
-                .then(|| Arc::new(SharedChannel::new(max_messages, richat))),
-            shared_finalized: pubsub
-                .then(|| Arc::new(SharedChannel::new(max_messages, richat))),
+            shared_processed: Arc::new(SharedChannel::new(max_messages, richat, grpc)),
+            shared_confirmed: (grpc || pubsub)
+                .then(|| Arc::new(SharedChannel::new(max_messages, richat, grpc))),
+            shared_finalized: (grpc || pubsub)
+                .then(|| Arc::new(SharedChannel::new(max_messages, richat, grpc))),
             max_messages,
             max_bytes: config.max_bytes,
             parser,
@@ -438,6 +439,16 @@ impl Messages {
         }
     }
 
+    pub fn replay_from_storage(
+        &self,
+        client: SubscribeClient,
+        metric_cpu_usage: Gauge,
+    ) -> Result<(), &'static str> {
+        self.storage
+            .as_ref()
+            .ok_or("storage should exists to replay messages")?
+            .replay(client, Arc::clone(&self.shared_processed), metric_cpu_usage)
+    }
 }
 
 impl Subscribe for Messages {
@@ -978,7 +989,7 @@ impl fmt::Debug for SharedChannel {
 }
 
 impl SharedChannel {
-    fn new(max_messages: usize, richat: bool) -> Self {
+    fn new(max_messages: usize, richat: bool, grpc: bool) -> Self {
         let mut buffer = Vec::with_capacity(max_messages);
         for i in 0..max_messages {
             buffer.push(Mutex::new(Item {
@@ -995,7 +1006,7 @@ impl SharedChannel {
             buffer: buffer.into_boxed_slice(),
             slots: Mutex::default(),
             wakers: richat.then_some(Mutex::default()),
-            sync_notify: None,
+            sync_notify: grpc.then(|| (Mutex::new(()), Condvar::new())),
         }
     }
 

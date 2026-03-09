@@ -1,5 +1,6 @@
 use {
     crate::{
+        grpc::config::ConfigAppsGrpc,
         pubsub::config::ConfigAppsPubsub,
         richat::config::ConfigAppsRichat,
     },
@@ -317,6 +318,8 @@ pub struct ConfigApps {
     pub tokio: ConfigTokio,
     /// downstream richat
     pub richat: Option<ConfigAppsRichat>,
+    /// gRPC app (fully compatible with Yellowstone Dragon's Mouth)
+    pub grpc: Option<ConfigAppsGrpc>,
     /// WebSocket app (fully compatible with Solana PubSub)
     pub pubsub: Option<ConfigAppsPubsub>,
 }

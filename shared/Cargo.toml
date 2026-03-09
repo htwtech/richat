@@ -30,7 +30,6 @@ jsonrpsee-types = { workspace = true, optional = true }
 metrics = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 quanta = { workspace = true, optional = true }
-quinn = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 richat-metrics = { workspace = true, optional = true }
@@ -120,9 +119,11 @@ transports = [
     "dep:kanal",
     "dep:memmap2",
     "dep:prost",
+    "dep:protoc-bin-vendored",
     "dep:richat-proto",
     "dep:socket2",
-    "dep:thiserror",
+    "dep:tonic",
+    "dep:tonic-build",
     "dep:tracing",
     "config",
     "version",

@@ -8,6 +8,7 @@ use {
     richat::{
         channel::Messages,
         config::Config,
+        grpc::server::GrpcServer,
         pubsub::server::PubSubServer,
         richat::server::RichatServer,
         source::{ReceiveError, Subscriptions},
@@ -93,6 +94,7 @@ fn main() -> anyhow::Result<()> {
         sources_parser,
         config.channel.config,
         config.apps.richat.is_some(),
+        config.apps.grpc.is_some(),
         config.apps.pubsub.is_some(),
         shutdown.clone(),
     )?;
@@ -177,6 +179,12 @@ fn main() -> anyhow::Result<()> {
                     ready(Ok(())).boxed()
                 };
 
+                let grpc_fut = if let Some(config) = config.apps.grpc {
+                    GrpcServer::spawn(config, messages.clone(), shutdown.clone())?.boxed()
+                } else {
+                    ready(Ok(())).boxed()
+                };
+
                 let pubsub_fut = if let Some(config) = config.apps.pubsub {
                     PubSubServer::spawn(config, messages, shutdown.clone())?.boxed()
                 } else {
@@ -199,7 +207,7 @@ fn main() -> anyhow::Result<()> {
                     ready(Ok(())).boxed()
                 };
 
-                try_join_all(vec![richat_fut, pubsub_fut, metrics_fut])
+                try_join_all(vec![richat_fut, grpc_fut, pubsub_fut, metrics_fut])
                     .await
                     .map(|_| ())
             })

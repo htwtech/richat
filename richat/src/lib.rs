@@ -1,5 +1,6 @@
 pub mod channel;
 pub mod config;
+pub mod grpc;
 pub mod metrics;
 pub mod pubsub;
 pub mod richat;
