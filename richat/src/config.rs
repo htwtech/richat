@@ -1,10 +1,10 @@
 use {
     crate::{
-        grpc::config::ConfigAppsGrpc, pubsub::config::ConfigAppsPubsub,
+        pubsub::config::ConfigAppsPubsub,
         richat::config::ConfigAppsRichat,
     },
     futures::future::{TryFutureExt, ready, try_join_all},
-    richat_client::{grpc::ConfigGrpcClient, quic::ConfigQuicClient, shm::ConfigShmClient},
+    richat_client::shm::ConfigShmClient,
     richat_filter::message::MessageParserEncoding,
     richat_metrics::ConfigMetrics,
     richat_shared::{
@@ -95,24 +95,15 @@ pub struct ConfigChannel {
 impl ConfigChannel {
     pub fn get_messages_parser(&self) -> MessageParserEncoding {
         if let Some(source) = self.sources.first() {
-            return match source {
-                ConfigChannelSource::Quic { general, .. } => general.parser,
-                ConfigChannelSource::Grpc { general, .. } => general.parser,
-                ConfigChannelSource::Shm { general, .. } => general.parser,
-            };
+            return source.general.parser;
         }
         panic!("sources list is empty — should have been rejected during deserialization")
     }
 
     pub fn ensure_sources_have_reconnect(&self) -> anyhow::Result<()> {
         for source in &self.sources {
-            let has_reconnect = match source {
-                ConfigChannelSource::Quic { general, .. } => general.reconnect.is_some(),
-                ConfigChannelSource::Grpc { general, .. } => general.reconnect.is_some(),
-                ConfigChannelSource::Shm { general, .. } => general.reconnect.is_some(),
-            };
             anyhow::ensure!(
-                has_reconnect,
+                source.general.reconnect.is_some(),
                 "source '{}' must have reconnect configured for SIGHUP reload",
                 source.name()
             );
@@ -132,20 +123,8 @@ impl ConfigChannel {
         let mut names = HashSet::new();
         let mut parsers = HashSet::new();
         for source in sources.iter() {
-            match source {
-                ConfigChannelSource::Quic { general, .. } => {
-                    names.insert(&general.name);
-                    parsers.insert(general.parser);
-                }
-                ConfigChannelSource::Grpc { general, .. } => {
-                    names.insert(&general.name);
-                    parsers.insert(general.parser);
-                }
-                ConfigChannelSource::Shm { general, .. } => {
-                    names.insert(&general.name);
-                    parsers.insert(general.parser);
-                }
-            }
+            names.insert(&source.general.name);
+            parsers.insert(source.general.parser);
         }
 
         if names.len() != sources.len() {
@@ -165,42 +144,19 @@ impl ConfigChannel {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields, tag = "transport")]
-pub enum ConfigChannelSource {
-    #[serde(rename = "quic")]
-    Quic {
-        #[serde(flatten)]
-        general: ConfigChannelSourceGeneral,
-        #[serde(flatten)]
-        config: ConfigQuicClient,
-    },
-    #[serde(rename = "grpc")]
-    Grpc {
-        #[serde(flatten)]
-        general: ConfigChannelSourceGeneral,
-        source: ConfigGrpcClientSource,
-        #[serde(flatten)]
-        config: ConfigGrpcClient,
-    },
-    #[serde(rename = "shm")]
-    Shm {
-        #[serde(flatten)]
-        general: ConfigChannelSourceGeneral,
-        #[serde(flatten)]
-        config: ConfigShmClient,
-        #[serde(default)]
-        pre_filter: Option<ConfigShmPreFilter>,
-    },
+#[serde(deny_unknown_fields)]
+pub struct ConfigChannelSource {
+    #[serde(flatten)]
+    pub general: ConfigChannelSourceGeneral,
+    #[serde(flatten)]
+    pub config: ConfigShmClient,
+    #[serde(default)]
+    pub pre_filter: Option<ConfigShmPreFilter>,
 }
 
 impl ConfigChannelSource {
-    #[allow(clippy::missing_const_for_fn)]
     pub fn name(&self) -> &str {
-        match self {
-            Self::Quic { general, .. } => &general.name,
-            Self::Grpc { general, .. } => &general.name,
-            Self::Shm { general, .. } => &general.name,
-        }
+        &self.general.name
     }
 }
 
@@ -251,14 +207,6 @@ impl ConfigChannelSourceReconnect {
     const fn default_multiplier() -> f64 {
         2.0
     }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub enum ConfigGrpcClientSource {
-    DragonsMouth,
-    #[default]
-    Richat,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -369,8 +317,6 @@ pub struct ConfigApps {
     pub tokio: ConfigTokio,
     /// downstream richat
     pub richat: Option<ConfigAppsRichat>,
-    /// gRPC app (fully compatible with Yellowstone Dragon's Mouth)
-    pub grpc: Option<ConfigAppsGrpc>,
     /// WebSocket app (fully compatible with Solana PubSub)
     pub pubsub: Option<ConfigAppsPubsub>,
 }

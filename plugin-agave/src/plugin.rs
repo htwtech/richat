@@ -1,10 +1,8 @@
 use {
     crate::{
-        channel::Sender,
         config::Config,
         metrics,
         protobuf::{ProtobufEncoder, ProtobufMessage},
-        version::VERSION,
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
@@ -13,17 +11,13 @@ use {
     },
     futures::future::BoxFuture,
     log::error,
-    richat_metrics::{MaybeRecorder, gauge},
-    richat_shared::transports::{
-        grpc::GrpcServer,
-        quic::QuicServer,
-        shm::{
-            ShmDirectWriter, ShmWriteMeta, bloom256,
-            FLAG_ACC_EXECUTABLE, FLAG_ACC_HAS_TXN_SIG,
-            FLAG_TX_FAILED, FLAG_TX_IS_VOTE,
-            MSG_TYPE_ACCOUNT, MSG_TYPE_BLOCK_META, MSG_TYPE_ENTRY, MSG_TYPE_SLOT,
-            MSG_TYPE_TRANSACTION,
-        },
+    richat_metrics::MaybeRecorder,
+    richat_shared::transports::shm::{
+        ShmDirectWriter, ShmWriteMeta, bloom256,
+        FLAG_ACC_EXECUTABLE, FLAG_ACC_HAS_TXN_SIG,
+        FLAG_TX_FAILED, FLAG_TX_IS_VOTE,
+        MSG_TYPE_ACCOUNT, MSG_TYPE_BLOCK_META, MSG_TYPE_ENTRY, MSG_TYPE_SLOT,
+        MSG_TYPE_TRANSACTION,
     },
     solana_clock::Slot,
     solana_message::VersionedMessage,
@@ -72,7 +66,6 @@ thread_local! {
 #[derive(Debug)]
 pub struct PluginInner {
     runtime: Runtime,
-    messages: Option<Sender>,
     shm_direct: Option<Arc<ShmDirectWriter>>,
     encoder: ProtobufEncoder,
     shutdown: CancellationToken,
@@ -82,30 +75,14 @@ pub struct PluginInner {
 
 impl PluginInner {
     fn dispatch(&self, message: ProtobufMessage) {
-        match (&self.shm_direct, &self.messages) {
-            // SHM-only: encode into thread-local buffer, write directly with V2 metadata
-            (Some(shm), None) => {
-                let slot = message.get_slot();
-                let write_meta = Self::extract_shm_meta(&message);
-                ENCODE_BUF.with(|buf| {
-                    let mut buf = buf.borrow_mut();
-                    message.encode_into(self.encoder, &mut buf);
-                    shm.write(&buf, slot, &write_meta);
-                });
-            }
-            // Channel-only (no SHM): existing path
-            (None, Some(sender)) => {
-                sender.push(message, self.encoder);
-            }
-            // Combined: encode once into owned Vec, write to SHM, move into channel (no clone)
-            (Some(shm), Some(sender)) => {
-                let slot = message.get_slot();
-                let write_meta = Self::extract_shm_meta(&message);
-                let data = message.encode(self.encoder);
-                shm.write(&data, slot, &write_meta);
-                sender.push_pre_encoded(message, data, self.encoder);
-            }
-            (None, None) => {}
+        if let Some(shm) = &self.shm_direct {
+            let slot = message.get_slot();
+            let write_meta = Self::extract_shm_meta(&message);
+            ENCODE_BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                message.encode_into(self.encoder, &mut buf);
+                shm.write(&buf, slot, &write_meta);
+            });
         }
     }
 
@@ -194,7 +171,7 @@ impl PluginInner {
     }
 
     fn new(config: Config) -> PluginResult<Self> {
-        let (metrics_recorder, metrics_handle) = if config.metrics.is_some() {
+        let (_metrics_recorder, metrics_handle) = if config.metrics.is_some() {
             let recorder = metrics::setup();
             let handle = recorder.handle();
             (Arc::new(recorder.into()), Some(handle))
@@ -208,16 +185,6 @@ impl PluginInner {
             .build_runtime("richatPlugin")
             .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
 
-        // Determine if we need the channel (for gRPC/QUIC subscribers)
-        let needs_channel = config.grpc.is_some() || config.quic.is_some();
-
-        // Create messages store only if needed
-        let messages = if needs_channel {
-            Some(Sender::new(config.channel, Arc::clone(&metrics_recorder)))
-        } else {
-            None
-        };
-
         // Create SHM direct writer if configured
         let shm_direct = if config.shm.is_some() {
             Some(Arc::new(
@@ -229,58 +196,10 @@ impl PluginInner {
         };
 
         // Spawn servers
-        let (messages, shutdown, tasks) = runtime
+        let (shutdown, tasks) = runtime
             .block_on(async move {
                 let shutdown = CancellationToken::new();
-                let mut tasks = Vec::with_capacity(4);
-
-                // Start gRPC
-                if let Some(config) = config.grpc {
-                    let sender = messages.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("channel required for gRPC but was not created"))?;
-                    let connections_inc = gauge!(&metrics_recorder, metrics::CONNECTIONS_TOTAL, "transport" => "grpc");
-                    let connections_dec = connections_inc.clone();
-                    tasks.push((
-                        "gRPC Server",
-                        PluginTask(Box::pin(
-                            GrpcServer::spawn(
-                                config,
-                                sender.clone(),
-                                move || connections_inc.increment(1), // on_conn_new_cb
-                                move || connections_dec.decrement(1), // on_conn_drop_cb
-                                VERSION,
-                                shutdown.clone(),
-                            )
-                            .await?,
-                        )),
-                    ));
-                }
-
-                // Start Quic
-                if let Some(config) = config.quic {
-                    let sender = messages.as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("channel required for QUIC but was not created"))?;
-                    let connections_inc = gauge!(&metrics_recorder, metrics::CONNECTIONS_TOTAL, "transport" => "quic");
-                    let connections_dec = connections_inc.clone();
-                    tasks.push((
-                        "Quic Server",
-                        PluginTask(Box::pin(
-                            QuicServer::spawn(
-                                config,
-                                sender.clone(),
-                                move || connections_inc.increment(1), // on_conn_new_cb
-                                move || connections_dec.decrement(1), // on_conn_drop_cb
-                                VERSION,
-                                shutdown.clone(),
-                            )
-                            .await?,
-                        )),
-                    ));
-                }
-
-                // Start Shm via ShmServer only when NOT using ShmDirectWriter
-                // (i.e. this path is no longer taken since we use ShmDirectWriter)
-                // Kept for reference but the shm config is now handled above.
+                let mut tasks = Vec::with_capacity(1);
 
                 // Start prometheus server
                 if let (Some(config), Some(metrics_handle)) = (config.metrics, metrics_handle) {
@@ -292,13 +211,12 @@ impl PluginInner {
                     ));
                 }
 
-                Ok::<_, anyhow::Error>((messages, shutdown, tasks))
+                Ok::<_, anyhow::Error>((shutdown, tasks))
             })
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
 
         Ok(Self {
             runtime,
-            messages,
             shm_direct,
             encoder: config.channel.encoder,
             shutdown,
@@ -345,9 +263,6 @@ impl GeyserPlugin for Plugin {
 
     fn on_unload(&mut self) {
         if let Some(inner) = self.inner.take() {
-            if let Some(ref messages) = inner.messages {
-                messages.close();
-            }
             if let Some(ref shm) = inner.shm_direct {
                 shm.close();
             }

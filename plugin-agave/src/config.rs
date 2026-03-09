@@ -5,8 +5,8 @@ use {
     },
     richat_metrics::ConfigMetrics,
     richat_shared::{
-        config::{ConfigTokio, deserialize_humansize_usize, deserialize_num_str},
-        transports::{grpc::ConfigGrpcServer, quic::ConfigQuicServer, shm::ConfigShmServer},
+        config::ConfigTokio,
+        transports::shm::ConfigShmServer,
     },
     serde::{
         Deserialize,
@@ -23,8 +23,6 @@ pub struct Config {
     pub metrics: Option<ConfigMetrics>,
     pub tokio: ConfigTokio,
     pub channel: ConfigChannel,
-    pub quic: Option<ConfigQuicServer>,
-    pub grpc: Option<ConfigGrpcServer>,
     pub shm: Option<ConfigShmServer>,
     /// Tokio runtime shutdown timeout in seconds (default: 10)
     #[serde(default = "Config::default_shutdown_timeout_secs")]
@@ -68,20 +66,12 @@ impl Default for ConfigLogs {
 pub struct ConfigChannel {
     #[serde(deserialize_with = "ConfigChannel::deserialize_encoder")]
     pub encoder: ProtobufEncoder,
-    #[serde(deserialize_with = "deserialize_num_str")]
-    pub max_messages: usize,
-    #[serde(deserialize_with = "deserialize_humansize_usize")]
-    pub max_bytes: usize,
 }
 
 impl Default for ConfigChannel {
     fn default() -> Self {
         Self {
             encoder: ProtobufEncoder::Raw,
-            // 2M messages (~20k/slot → ~100 slots in buffer). Must be power of 2.
-            max_messages: 2_097_152,
-            // 15 GiB (~150 MiB/slot → ~100 slots in buffer).
-            max_bytes: 15 * 1024 * 1024 * 1024,
         }
     }
 }

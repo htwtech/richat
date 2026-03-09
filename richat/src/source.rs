@@ -3,7 +3,7 @@ use {
         channel::GlobalReplayFromSlot,
         config::{
             ConfigChannelSource, ConfigChannelSourceGeneral, ConfigChannelSourceReconnect,
-            ConfigGrpcClientSource, ConfigShmPreFilter,
+            ConfigShmPreFilter,
         },
     },
     anyhow::Context as _,
@@ -11,25 +11,10 @@ use {
         future::try_join_all,
         stream::{BoxStream, Stream, StreamExt, try_unfold},
     },
-    maplit::hashmap,
-    richat_client::{
-        grpc::{ConfigGrpcClient, GrpcClientBuilderError},
-        quic::{ConfigQuicClient, QuicConnectError},
-        shm::{ConfigShmClient, ShmConnectError, ShmEntryMeta, ShmSubscription},
-    },
+    richat_client::shm::{ShmConnectError, ShmEntryMeta, ShmSubscription},
     richat_filter::message::{Message, MessageParseError, MessageParserEncoding},
-    richat_proto::{
-        geyser::{
-            CommitmentLevel as CommitmentLevelProto, SubscribeRequest,
-            SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocksMeta,
-            SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
-            SubscribeRequestFilterTransactions,
-        },
-        richat::{GrpcSubscribeRequest, RichatFilter},
-    },
-    solana_clock::Slot,
     std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         fmt,
         pin::Pin,
         sync::{LazyLock, Mutex},
@@ -37,16 +22,11 @@ use {
     },
     thiserror::Error,
     tokio::time::{Duration, sleep},
-    tonic::Code,
     tracing::{error, info},
 };
 
 #[derive(Debug, Error)]
 enum ConnectError {
-    #[error(transparent)]
-    Quic(QuicConnectError),
-    #[error(transparent)]
-    Grpc(GrpcClientBuilderError),
     #[error(transparent)]
     Shm(ShmConnectError),
 }
@@ -55,53 +35,14 @@ enum ConnectError {
 enum SubscribeError {
     #[error(transparent)]
     Connect(#[from] ConnectError),
-    #[error(transparent)]
-    Subscribe(#[from] richat_client::error::SubscribeError),
-    #[error(transparent)]
-    SubscribeGrpc(#[from] tonic::Status),
 }
 
 #[derive(Debug, Error)]
 pub enum ReceiveError {
     #[error(transparent)]
-    Receive(#[from] richat_client::error::ReceiveError),
-    #[error(transparent)]
     Parse(#[from] MessageParseError),
     #[error("replay from the requested slot is not available from any source")]
     ReplayFailed,
-}
-
-#[derive(Debug, Clone)]
-enum SubscriptionConfig {
-    Quic {
-        config: ConfigQuicClient,
-    },
-    Grpc {
-        source: ConfigGrpcClientSource,
-        config: ConfigGrpcClient,
-    },
-    Shm {
-        config: ConfigShmClient,
-        pre_filter: Option<crate::config::ConfigShmPreFilter>,
-    },
-}
-
-impl SubscriptionConfig {
-    fn new(config: ConfigChannelSource) -> (Self, ConfigChannelSourceGeneral) {
-        match config {
-            ConfigChannelSource::Quic { general, config } => (Self::Quic { config }, general),
-            ConfigChannelSource::Grpc {
-                general,
-                source,
-                config,
-            } => (Self::Grpc { source, config }, general),
-            ConfigChannelSource::Shm {
-                general,
-                config,
-                pre_filter,
-            } => (Self::Shm { config, pre_filter }, general),
-        }
-    }
 }
 
 /// Fast pre-filter using V2 SHM index metadata.
@@ -263,22 +204,22 @@ impl Subscription {
         source_config: ConfigChannelSource,
         global_replay_from_slot: GlobalReplayFromSlot,
     ) -> anyhow::Result<Self> {
-        let (subscription_config, mut config) = SubscriptionConfig::new(source_config.clone());
-        let name = Self::get_static_name(&config.name);
+        let name = Self::get_static_name(&source_config.general.name);
+        let mut config = source_config.general.clone();
 
         let stream = if let Some(reconnect) = config.reconnect.take() {
             let backoff = Backoff::new(reconnect);
             try_unfold(
                 (
                     backoff,
-                    subscription_config,
+                    source_config.clone(),
                     config,
                     global_replay_from_slot,
                     None,
                 ),
                 move |mut state: (
                     Backoff,
-                    SubscriptionConfig,
+                    ConfigChannelSource,
                     ConfigChannelSourceGeneral,
                     GlobalReplayFromSlot,
                     Option<kanal::AsyncReceiver<SubscriptionMessage>>,
@@ -307,11 +248,9 @@ impl Subscription {
                         } else {
                             match Subscription::subscribe(
                                 name,
-                                state.1.clone(),
-                                state.2.disable_accounts,
+                                &state.1,
                                 state.2.parser,
                                 state.2.channel_size,
-                                state.3.load(),
                             )
                             .await
                             {
@@ -332,11 +271,9 @@ impl Subscription {
         } else {
             let rx = Self::subscribe(
                 name,
-                subscription_config,
-                config.disable_accounts,
+                &source_config,
                 config.parser,
                 config.channel_size,
-                global_replay_from_slot.load(),
             )
             .await?;
             futures::stream::unfold(
@@ -368,146 +305,27 @@ impl Subscription {
 
     async fn subscribe(
         name: &'static str,
-        config: SubscriptionConfig,
-        disable_accounts: bool,
+        source: &ConfigChannelSource,
         parser: MessageParserEncoding,
         channel_size: usize,
-        replay_from_slot: Option<Slot>,
     ) -> Result<kanal::AsyncReceiver<SubscriptionMessage>, SubscribeError> {
-        let (tx, rx) = kanal::bounded_async(channel_size);
-
-        let mut stream = match config {
-            SubscriptionConfig::Quic { config } => {
-                let connection = config.connect().await.map_err(ConnectError::Quic)?;
-                let filter = Self::create_richat_filter(disable_accounts);
-                match connection.subscribe(replay_from_slot, filter).await {
-                    Ok(stream) => {
-                        info!(name, version = stream.get_version(), "connected");
-                        stream.boxed()
-                    }
-                    Err(richat_client::error::SubscribeError::ReplayFromSlotNotAvailable(_)) => {
-                        let _ = tx.send(Err(ReceiveError::ReplayFailed)).await;
-                        return Ok(rx);
-                    }
-                    Err(error) => return Err(error.into()),
+        let sub = ShmSubscription::open(&source.config).map_err(ConnectError::Shm)?;
+        let pf = ShmPreFilter::from_config(source.pre_filter.clone());
+        let has_pre_filter = !pf.is_noop();
+        info!(name, has_pre_filter, "attached to shared memory");
+        let rx = sub.subscribe_filter_map_v2(
+            channel_size,
+            move |meta| pf.should_accept(meta),
+            move |_meta, data| {
+                match Message::parse(data.into(), parser) {
+                    Ok(message) => Some(Ok((name, message))),
+                    Err(MessageParseError::InvalidUpdateMessage("Ping")) => None,
+                    Err(error) => Some(Err(error.into())),
                 }
-            }
-            SubscriptionConfig::Grpc { source, config } => {
-                let mut connection = config.connect().await.map_err(ConnectError::Grpc)?;
-                match source {
-                    ConfigGrpcClientSource::DragonsMouth => {
-                        let version = connection
-                            .get_version()
-                            .await
-                            .map_err(|error| ConnectError::Grpc(error.into()))?;
-                        info!(name, version = version.version, "connected");
-                        connection
-                            .subscribe_dragons_mouth_once(Self::create_dragons_mouth_filter(
-                                disable_accounts,
-                                replay_from_slot,
-                            ))
-                            .await?
-                            .boxed()
-                    }
-                    ConfigGrpcClientSource::Richat => connection
-                        .subscribe_richat(GrpcSubscribeRequest {
-                            replay_from_slot,
-                            filter: Self::create_richat_filter(disable_accounts),
-                        })
-                        .await?
-                        .boxed(),
-                }
-            }
-            SubscriptionConfig::Shm {
-                config,
-                pre_filter,
-            } => {
-                let sub = ShmSubscription::open(&config).map_err(ConnectError::Shm)?;
-                let pf = ShmPreFilter::from_config(pre_filter);
-                let has_pre_filter = !pf.is_noop();
-                info!(name, has_pre_filter, "attached to shared memory");
-                // Parse directly in the SHM reader thread with V2 metadata pre-filter.
-                // Messages that fail the pre-filter are skipped without reading data.
-                let rx = sub.subscribe_filter_map_v2(
-                    channel_size,
-                    move |meta| pf.should_accept(meta),
-                    move |_meta, data| {
-                        match Message::parse(data.into(), parser) {
-                            Ok(message) => Some(Ok((name, message))),
-                            Err(MessageParseError::InvalidUpdateMessage("Ping")) => None,
-                            Err(error) => Some(Err(error.into())),
-                        }
-                    },
-                );
-                info!(name, "subscribed");
-                return Ok(rx.to_async());
-            }
-        };
-        info!(name, "subscribed");
-
-        tokio::spawn(async move {
-            loop {
-                let message = match stream.next().await {
-                    Some(Ok(data)) => match Message::parse(data.into(), parser) {
-                        Ok(message) => Ok((name, message)),
-                        Err(MessageParseError::InvalidUpdateMessage("Ping")) => continue,
-                        Err(error) => Err(error.into()),
-                    },
-                    Some(Err(error)) => {
-                        if matches!(
-                            &error,
-                            richat_client::error::ReceiveError::Status(status)
-                                if (status.code() == Code::InvalidArgument && status.message().contains("replay")) || status.code() == Code::DataLoss
-                        ) {
-                            Err(ReceiveError::ReplayFailed)
-                        } else {
-                            Err(error.into())
-                        }
-                    }
-                    None => break,
-                };
-
-                if tx.send(message).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(rx)
-    }
-
-    const fn create_richat_filter(disable_accounts: bool) -> Option<RichatFilter> {
-        Some(RichatFilter {
-            disable_accounts,
-            disable_transactions: false,
-            disable_entries: false,
-        })
-    }
-
-    fn create_dragons_mouth_filter(
-        disable_accounts: bool,
-        from_slot: Option<Slot>,
-    ) -> SubscribeRequest {
-        SubscribeRequest {
-            accounts: if disable_accounts {
-                HashMap::new()
-            } else {
-                hashmap! { "".to_owned() => SubscribeRequestFilterAccounts::default() }
             },
-            slots: hashmap! { "".to_owned() => SubscribeRequestFilterSlots {
-                filter_by_commitment: Some(false),
-                interslot_updates: Some(true),
-            } },
-            transactions: hashmap! { "".to_owned() => SubscribeRequestFilterTransactions::default() },
-            transactions_status: HashMap::new(),
-            blocks: HashMap::new(),
-            blocks_meta: hashmap! { "".to_owned() => SubscribeRequestFilterBlocksMeta::default() },
-            entry: hashmap! { "".to_owned() => SubscribeRequestFilterEntry::default() },
-            commitment: Some(CommitmentLevelProto::Processed as i32),
-            accounts_data_slice: vec![],
-            ping: None,
-            from_slot,
-        }
+        );
+        info!(name, "subscribed");
+        Ok(rx.to_async())
     }
 }
 
