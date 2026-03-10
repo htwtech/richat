@@ -671,28 +671,24 @@ impl Sender {
                         shared.push(slot, message.clone(), None);
                     }
 
-                    // push messages to confirmed
+                    // push messages to confirmed (batched: single lock + single notify)
                     if msg.status() == SlotStatus::SlotConfirmed {
                         self.slot_confirmed = slot;
                         if let Some(shared) = self.confirmed.as_mut() {
                             if let Some(slot_info) = self.slots.get(&slot) {
-                                for message in slot_info.get_messages_cloned() {
-                                    shared.push(slot, message, None);
-                                }
+                                shared.push_batch(slot, slot_info.get_messages_cloned());
                             }
                         }
                     }
 
-                    // push messages to finalized
+                    // push messages to finalized (batched: single lock + single notify)
                     if msg.status() == SlotStatus::SlotFinalized {
                         clean_after_finalized = true;
                         self.slot_finalized = slot;
                         self.global_replay_from_slot.store(slot + 1);
                         if let Some(shared) = self.finalized.as_mut() {
                             if let Some(mut slot_info) = self.slots.remove(&slot) {
-                                for message in slot_info.get_messages_owned() {
-                                    shared.push(slot, message, None);
-                                }
+                                shared.push_batch(slot, slot_info.get_messages_owned());
                             }
                         }
                     }
@@ -836,7 +832,7 @@ impl SenderShared {
 
         // notify sync waiters (gRPC workers)
         if let Some((_, cvar)) = &self.shared.sync_notify {
-            cvar.notify_all();
+            cvar.notify_one();
         }
 
         // update slot head info
@@ -851,6 +847,87 @@ impl SenderShared {
                     Some((slot, _)) if *slot <= remove_upto => {
                         let slot = *slot;
                         slots_lock.remove(&slot);
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    /// Batch push: acquires slots_lock once, writes all items, updates tail once, notifies once.
+    /// Used for confirmed/finalized replay to avoid per-message lock + notify overhead.
+    fn push_batch(
+        &mut self,
+        slot: Slot,
+        messages: impl Iterator<Item = ParsedMessage>,
+    ) {
+        let mut slots_lock = self.shared.slots_lock();
+        let mut removed_max_slot: Option<Slot> = None;
+        let mut count = 0u64;
+
+        for message in messages {
+            self.tail = self.tail.wrapping_add(1);
+            self.bytes_total += message.size();
+
+            let idx = self.shared.get_idx(self.tail);
+            let mut item = self.shared.buffer_idx(idx);
+            if let Some(old_message) = item.data.take() {
+                self.head = self.head.wrapping_add(1);
+                self.bytes_total -= old_message.size();
+                removed_max_slot = Some(match removed_max_slot {
+                    Some(s) => item.slot.max(s),
+                    None => item.slot,
+                });
+            }
+            item.replay_index = u64::MAX;
+            item.pos = self.tail;
+            item.slot = slot;
+            item.data = Some(message);
+            drop(item);
+
+            // evict by bytes (inline to keep slots_lock held)
+            while self.bytes_total >= self.bytes_max && self.head < self.tail {
+                let idx = self.shared.get_idx(self.head);
+                let mut evict = self.shared.buffer_idx(idx);
+                let Some(old_msg) = evict.data.take() else {
+                    tracing::error!("bytes accounting inconsistency in push_batch; breaking eviction loop");
+                    break;
+                };
+                self.head = self.head.wrapping_add(1);
+                self.bytes_total -= old_msg.size();
+                removed_max_slot = Some(match removed_max_slot {
+                    Some(s) => evict.slot.max(s),
+                    None => evict.slot,
+                });
+            }
+
+            count += 1;
+        }
+
+        if count == 0 {
+            return;
+        }
+
+        // store new tail position once
+        self.shared.tail.store(self.tail, Ordering::Relaxed);
+
+        // notify once
+        if let Some((_, cvar)) = &self.shared.sync_notify {
+            cvar.notify_one();
+        }
+
+        // update slot head
+        slots_lock
+            .entry(slot)
+            .or_insert_with(|| SlotHead { head: self.tail.wrapping_sub(count - 1) });
+
+        // remove evicted slots
+        if let Some(remove_upto) = removed_max_slot {
+            loop {
+                match slots_lock.first_key_value() {
+                    Some((s, _)) if *s <= remove_upto => {
+                        let s = *s;
+                        slots_lock.remove(&s);
                     }
                     _ => break,
                 }
