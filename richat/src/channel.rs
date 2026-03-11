@@ -832,7 +832,7 @@ impl SenderShared {
 
         // notify sync waiters (gRPC workers)
         if let Some((_, cvar)) = &self.shared.sync_notify {
-            cvar.notify_one();
+            cvar.notify_all();
         }
 
         // update slot head info
@@ -911,9 +911,9 @@ impl SenderShared {
         // store new tail position once
         self.shared.tail.store(self.tail, Ordering::Relaxed);
 
-        // notify once
+        // notify all workers (each serves different clients)
         if let Some((_, cvar)) = &self.shared.sync_notify {
-            cvar.notify_one();
+            cvar.notify_all();
         }
 
         // update slot head
